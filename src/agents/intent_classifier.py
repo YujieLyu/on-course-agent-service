@@ -1,14 +1,30 @@
-from openai import AsyncOpenAI
-
-from src.models import IntentClassification
+from src.models import ChatMessage, IntentClassification
 from src.workflow.llm import load_system_prompt, request_structured_output
 
-async def intent_classify(query: str, client_type: str, model:str) -> IntentClassification:
+async def intent_classify(
+    query: str,
+    client_type: str,
+    model: str,
+    chat_history: list[ChatMessage] | None = None,
+) -> IntentClassification:
     system_prompt = load_system_prompt("intent_classifier")
-    return request_structured_output(
+    instructions = system_prompt.substitute(
+        conversation_context=_format_conversation_context(chat_history or [])
+    )
+    return await request_structured_output(
         client_type=client_type,
         model=model,
-        instructions=system_prompt,
+        instructions=instructions,
         input=query,
-        text_format= IntentClassification
+        output_type=IntentClassification,
+        request_name="Intent classifier",
+    )
+
+def _format_conversation_context(chat_history: list[ChatMessage]) -> str:
+    if not chat_history:
+        return "No prior conversation."
+
+    recent_messages = chat_history[-6:]
+    return "\n".join(
+        f"{message.role}: {message.content}" for message in recent_messages
     )

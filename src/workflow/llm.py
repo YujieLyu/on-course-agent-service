@@ -13,7 +13,7 @@ from src.config import load_openai_settings
 from src.models import ClientType
 
 StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
-PROMPT_ROOT = Path(__file__).resolve().parent / "prompts"
+PROMPT_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 
 def load_system_prompt(agent_name: str) -> Template:
     prompt_path = PROMPT_ROOT / agent_name / "system.md"
@@ -38,14 +38,6 @@ def create_llm_client(client_type: ClientType) -> AsyncOpenAI:
 def create_openai_client() -> AsyncOpenAI:
     settings = load_openai_settings()
     return AsyncOpenAI(
-        base_url=settings["endpoint"],
-        api_key=settings["key"],
-    )
-
-
-def create_sync_openai_client() -> OpenAI:
-    settings = load_openai_settings()
-    return OpenAI(
         base_url=settings["endpoint"],
         api_key=settings["key"],
     )
@@ -76,7 +68,7 @@ def parse_structured_response(
 
     return parsed
 
-def request_structured_output(
+async def request_structured_output(
     *,
     client_type: ClientType,
     model: str,
@@ -87,7 +79,7 @@ def request_structured_output(
 ) -> StructuredOutputT:
     """Call the Responses API and return a validated Pydantic model."""
     client = create_llm_client(client_type)
-    response = client.responses.parse(
+    response = await client.responses.parse(
         model=model,
         instructions=instructions,
         input=input,

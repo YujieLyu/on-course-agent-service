@@ -56,20 +56,24 @@ class IntentClassification(StrictModel):
     search_sources: list[SearchSource] = Field(
         description="Search sources needed to answer the question; use an empty list when no search is needed."
     )
+    search_query: str | None = Field(
+        default=None,
+        description="Standalone query optimized for retrieval. Use null when no search is needed."
+    )
     needs_clarification: bool
     clarification_question: str | None = None
 
 class ChatMessage(StrictModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1)
-    created_at: datetime | None
+    created_at: datetime | None = None
 
 
 class ReplyRequest(StrictModel):
     question: str = Field(min_length=1)
     user_id: str
     course_id: str
-    chat_history: list[ChatMessage]
+    chat_history: list[ChatMessage] = Field(default_factory=list)
 
 class ReplyResponse(StrictModel):
     reply: str
