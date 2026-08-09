@@ -1,12 +1,25 @@
 
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, HTTPException, Response, status
 
-from src.agents.orchestrator import run_orchestration
+from src.agents.orchestrator import generate_session_revision, run_orchestration
 from src.logger import get_logger
-from src.models import ReplyRequest, ReplyResponse
+from src.models import (
+    CreateReplySessionRequest,
+    ReplyRequest,
+    ReplyResponse,
+    ReplySession,
+    ReviewReplySessionRequest,
+    SessionStatus,
+)
+from src.reply_sessions import (
+    InvalidSessionActionError,
+    ReplySessionStore,
+    SessionNotFoundError,
+)
 
 app = FastAPI()
 logger = get_logger(__name__)
+reply_sessions = ReplySessionStore()
 
 UPSTREAM_ERROR_RESPONSE = ReplyResponse(
     reply="The service could not complete the request.",
@@ -26,3 +39,69 @@ async def generate_reply(request: ReplyRequest, response: Response) -> ReplyResp
         logger.exception("Failed to generate reply due to an upstream dependency error")
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return UPSTREAM_ERROR_RESPONSE
+
+
+@app.post("/reply-sessions", response_model=ReplySession, status_code=201)
+async def create_reply_session(request: CreateReplySessionRequest) -> ReplySession:
+    try:
+        return await reply_sessions.create(request.question)
+    except Exception:
+        logger.exception("Failed to create reply session")
+        raise HTTPException(status_code=503, detail="The service could not create a session")
+
+
+@app.get("/reply-sessions/{conversation_id}", response_model=ReplySession)
+def get_reply_session(conversation_id: str) -> ReplySession:
+    try:
+        return reply_sessions.get(conversation_id)
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Reply session not found")
+
+
+@app.post("/reply-sessions/{conversation_id}/generate", response_model=ReplySession)
+async def generate_session_reply(conversation_id: str) -> ReplySession:
+    try:
+        session = reply_sessions.get(conversation_id)
+        if session.status == SessionStatus.REVISION_REQUESTED:
+            return await generate_session_revision(conversation_id, reply_sessions)
+        if session.status == SessionStatus.PENDING_GENERATION:
+            response = await run_orchestration(
+                ReplyRequest(
+                    question=session.student_query,
+                    user_id=conversation_id,
+                    course_id="reply-session",
+                ),
+                session_context=session.model_dump_json(),
+                conversation_id=conversation_id,
+            )
+            return reply_sessions.save_generation(conversation_id, response.reply)
+        raise InvalidSessionActionError("Session is not ready for generation")
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Reply session not found")
+    except InvalidSessionActionError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except Exception:
+        logger.exception("Failed to generate session reply")
+        raise HTTPException(status_code=503, detail="The service could not generate a reply")
+
+
+@app.post("/reply-sessions/{conversation_id}/review", response_model=ReplySession)
+def review_reply_session(
+    conversation_id: str, request: ReviewReplySessionRequest
+) -> ReplySession:
+    try:
+        return reply_sessions.request_revision(conversation_id, request.feedback)
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Reply session not found")
+    except InvalidSessionActionError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@app.post("/reply-sessions/{conversation_id}/accept", response_model=ReplySession)
+def accept_reply_session(conversation_id: str) -> ReplySession:
+    try:
+        return reply_sessions.accept(conversation_id)
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="Reply session not found")
+    except InvalidSessionActionError as error:
+        raise HTTPException(status_code=409, detail=str(error))

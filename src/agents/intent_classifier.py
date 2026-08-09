@@ -6,10 +6,12 @@ async def intent_classify(
     client_type: str,
     model: str,
     chat_history: list[ChatMessage] | None = None,
+    session_context: str | None = None,
 ) -> IntentClassification:
     system_prompt = load_system_prompt("intent_classifier")
     instructions = system_prompt.substitute(
-        conversation_context=_format_conversation_context(chat_history or [])
+        conversation_context=_format_conversation_context(chat_history or []),
+        session_context=session_context or "No active reply session.",
     )
     return await request_structured_output(
         client_type=client_type,

@@ -86,3 +86,30 @@ class ReplyResponse(StrictModel):
     ]
     citations: list[SearchResult]
 
+
+class SessionStatus(StrEnum):
+    PENDING_GENERATION = "pending_generation"
+    AWAITING_REVIEW = "awaiting_review"
+    REVISION_REQUESTED = "revision_requested"
+    ACCEPTED = "accepted"
+
+
+class Revision(StrictModel):
+    revision_number: int = Field(ge=1)
+    feedback: str | None = None
+    revision_content: str | None = None
+
+
+class ReplySession(StrictModel):
+    conversation_id: str
+    student_query: str = Field(min_length=1)
+    status: SessionStatus = SessionStatus.PENDING_GENERATION
+    revisions: list[Revision] = Field(default_factory=list)
+
+
+class CreateReplySessionRequest(StrictModel):
+    question: str = Field(min_length=1)
+
+
+class ReviewReplySessionRequest(StrictModel):
+    feedback: str = Field(min_length=1)
