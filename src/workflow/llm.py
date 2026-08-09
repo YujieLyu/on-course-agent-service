@@ -76,17 +76,26 @@ async def request_structured_output(
     input: str | ResponseInputParam,
     output_type: type[StructuredOutputT],
     request_name: str = "LLM request",
+    conversation_id: str | None = None,
 ) -> StructuredOutputT:
     """Call the Responses API and return a validated Pydantic model."""
     client = create_llm_client(client_type)
-    response = await client.responses.parse(
+    request = dict(
         model=model,
         instructions=instructions,
         input=input,
         text_format=output_type,
     )
+    if conversation_id is not None:
+        request["conversation"] = conversation_id
+    response = await client.responses.parse(**request)
     return parse_structured_response(
         response,
         output_type,
         request_name=request_name,
     )
+
+
+async def create_conversation() -> str:
+    conversation = await create_openai_client().conversations.create()
+    return conversation.id
