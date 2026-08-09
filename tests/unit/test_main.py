@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -44,6 +44,32 @@ class ReplyEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["reply"], "ok")
+
+    def test_returns_structured_error_when_orchestration_fails(self):
+        with patch(
+            "main.run_orchestration",
+            new=AsyncMock(side_effect=RuntimeError("upstream failure")),
+        ), patch("main.logger.exception") as mock_log_exception:
+            client = TestClient(app)
+            response = client.post(
+                "/reply",
+                json={
+                    "question": "What is due this week?",
+                    "user_id": "u1",
+                    "course_id": "c1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {
+                "reply": "The service could not complete the request.",
+                "status": "error",
+                "citations": [],
+            },
+        )
+        mock_log_exception.assert_called_once()
 
 
 if __name__ == "__main__":

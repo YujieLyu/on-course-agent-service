@@ -24,10 +24,22 @@ class AzureSearchHybridSearchTests(unittest.IsolatedAsyncioTestCase):
             "top_k": 3,
             "vector_field": "content_vector",
         }
-        with patch.object(search_methods, "_generate_embedding", new=AsyncMock(return_value=[0.1, 0.2])), patch.object(
-            search_methods, "create_search_client", return_value=FakeSearchClient()
-        ), patch.object(search_methods, "_get_ai_search_settings", return_value=search_settings):
-            result = await search_methods.azure_search_hybrid_search("How does this course work?")
+        with patch.object(
+            search_methods,
+            "_generate_embedding",
+            new=AsyncMock(return_value=[0.1, 0.2]),
+        ), patch.object(
+            search_methods,
+            "create_search_client",
+            return_value=FakeSearchClient(),
+        ), patch.object(
+            search_methods,
+            "_get_ai_search_settings",
+            return_value=search_settings,
+        ):
+            result = await search_methods.azure_search_hybrid_search(
+                "How does this course work?"
+            )
 
         self.assertIsInstance(result, SearchResults)
         self.assertEqual(result.query, "How does this course work?")
