@@ -1,4 +1,4 @@
-from src.agents.intent_classifier import _format_conversation_context
+from src.agents.context import format_conversation_context
 from src.models import ChatMessage, IntentClassification, ReplyResponse, SearchResult
 from src.workflow.llm import load_system_prompt, request_structured_output
 
@@ -17,7 +17,7 @@ async def run_answer(
     system_prompt = load_system_prompt("reply_agent")
     formatted_retrieved_context = _format_retrieved_context(retrieved_context or [])
     instructions = system_prompt.substitute(
-        conversation_context=_format_conversation_context(chat_history or []),
+        conversation_context=format_conversation_context(chat_history or []),
         retrieved_context=(
             "Use the authoritative context stored in the conversation's developer input."
             if conversation_id
