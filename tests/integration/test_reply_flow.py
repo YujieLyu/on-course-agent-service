@@ -10,10 +10,11 @@ from src.models import (
     IntentClassification,
     ReplyResponse,
     SearchResult,
+    SearchResults,
     SearchSource,
     StudentIntent,
 )
-from src.tools import search_methods
+from src.tools.search_providers import azure_ai_search, public_website_search
 
 
 TEST_ENV = {
@@ -76,13 +77,13 @@ class FakeWebResponse:
 
 class ReplyFlowIntegrationTests(unittest.TestCase):
     def setUp(self):
-        search_methods._get_ai_search_settings.cache_clear()
-        search_methods._get_web_search_settings.cache_clear()
+        azure_ai_search._get_settings.cache_clear()
+        public_website_search._get_settings.cache_clear()
         self.client = TestClient(app)
 
     def tearDown(self):
-        search_methods._get_ai_search_settings.cache_clear()
-        search_methods._get_web_search_settings.cache_clear()
+        azure_ai_search._get_settings.cache_clear()
+        public_website_search._get_settings.cache_clear()
 
     def test_health_check(self):
         response = self.client.get("/health")
@@ -124,7 +125,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.workflow.llm.AsyncOpenAI",
             return_value=llm_client,
         ) as openai_constructor, patch(
-            "src.workflow.llm.SearchClient",
+            "src.tools.search_providers.azure_ai_search.SearchClient",
             return_value=search_client,
         ) as search_constructor:
             response = self.client.post(
@@ -160,7 +161,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertIn("Assignment One requires a PDF report.", answer_instructions)
         self.assertIn("https://course.example.test/assignment-one", answer_instructions)
 
-    def test_university_policy_request_runs_web_retrieval(self):
+    def test_university_policy_request_runs_public_website_retrieval(self):
         classification = IntentClassification(
             intent=StudentIntent.ACADEMIC_INTEGRITY,
             search_sources=[SearchSource.UNIVERSITY_POLICIES],
@@ -191,10 +192,10 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.workflow.llm.AsyncOpenAI",
             return_value=llm_client,
         ), patch(
-            "src.tools.search_methods.urlopen",
+            "src.tools.search_providers.public_website_search.urlopen",
             return_value=FakeWebResponse(html),
         ) as mock_urlopen, patch(
-            "src.workflow.llm.SearchClient"
+            "src.tools.search_providers.azure_ai_search.SearchClient"
         ) as search_constructor:
             response = self.client.post(
                 "/reply",
@@ -218,7 +219,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertIn("Students must disclose generative AI use", answer_instructions)
         self.assertIn("https://policy.example.test/ai-use", answer_instructions)
 
-    def test_placeholder_sources_complete_without_external_retrieval(self):
+    def test_empty_canvas_and_historical_sources_complete(self):
         classification = IntentClassification(
             intent=StudentIntent.PERSONAL_STATUS,
             search_sources=[SearchSource.CANVAS, SearchSource.HISTORICAL_QNA],
@@ -237,10 +238,18 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.workflow.llm.AsyncOpenAI",
             return_value=llm_client,
         ), patch(
-            "src.workflow.llm.SearchClient"
+            "src.tools.search_providers.azure_ai_search.SearchClient"
         ) as search_constructor, patch(
-            "src.tools.search_methods.urlopen"
-        ) as mock_urlopen:
+            "src.tools.search_providers.public_website_search.urlopen"
+        ) as mock_urlopen, patch(
+            "src.tools.search_providers.historical_qna_search.search",
+            new=AsyncMock(
+                return_value=SearchResults(
+                    query="student submission status",
+                    results=[],
+                )
+            ),
+        ):
             response = self.client.post(
                 "/reply",
                 json={
@@ -281,9 +290,9 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.workflow.llm.AsyncOpenAI",
             return_value=llm_client,
         ), patch(
-            "src.workflow.llm.SearchClient"
+            "src.tools.search_providers.azure_ai_search.SearchClient"
         ) as search_constructor, patch(
-            "src.tools.search_methods.urlopen"
+            "src.tools.search_providers.public_website_search.urlopen"
         ) as mock_urlopen:
             response = self.client.post(
                 "/reply",
@@ -302,7 +311,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
 
     def test_invalid_request_is_rejected_before_external_calls(self):
         with patch("src.workflow.llm.AsyncOpenAI") as openai_constructor, patch(
-            "src.workflow.llm.SearchClient"
+            "src.tools.search_providers.azure_ai_search.SearchClient"
         ) as search_constructor:
             response = self.client.post(
                 "/reply",
@@ -332,7 +341,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.workflow.llm.AsyncOpenAI",
             return_value=llm_client,
         ), patch(
-            "src.workflow.llm.SearchClient",
+            "src.tools.search_providers.azure_ai_search.SearchClient",
             return_value=search_client,
         ), patch("main.logger.exception") as mock_log_exception:
             response = self.client.post(

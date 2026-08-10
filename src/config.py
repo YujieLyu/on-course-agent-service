@@ -38,7 +38,7 @@ def load_ai_search_settings() -> dict:
         logger.error("Failed to load search configuration", exc_info=e)
         raise
 
-def load_web_search_settings() -> dict:
+def load_public_website_search_settings() -> dict:
     try:
         return {
             "public_website_urls": [
@@ -52,9 +52,26 @@ def load_web_search_settings() -> dict:
         logger.error("Failed to load web search configuration", exc_info=e)
         raise
 
+def load_cosmos_qna_settings() -> dict:
+    try:
+        return {
+            "endpoint": os.environ["AZURE_COSMOS_ENDPOINT"],
+            "key": os.environ["AZURE_COSMOS_KEY"],
+            "database_name": os.environ["AZURE_COSMOS_DATABASE_NAME"],
+            "container_name": os.environ.get(
+                "AZURE_COSMOS_QA_MEMORY_CONTAINER", "qa_memory"
+            ),
+            "top_k": int(os.environ.get("AZURE_COSMOS_QNA_TOP_K", "3")),
+            "embedding_dimensions": int(
+                os.environ.get("AZURE_COSMOS_EMBEDDING_DIMENSIONS", "3072")
+            ),
+        }
+    except Exception as e:
+        logger.error("Failed to load Cosmos Q&A configuration", exc_info=e)
+        raise
+
 def get_log_format() -> str:
     return os.getenv(
         "LOG_FORMAT",
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    

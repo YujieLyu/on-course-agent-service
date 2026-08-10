@@ -18,10 +18,17 @@ class ReplySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, ReplySession] = {}
 
-    async def create(self, student_query: str) -> ReplySession:
+    async def create(
+        self,
+        student_query: str,
+        course_id: str,
+        user_id: str | None = None,
+    ) -> ReplySession:
         conversation_id = await create_conversation()
         session = ReplySession(
             conversation_id=conversation_id,
+            course_id=course_id,
+            user_id=user_id,
             student_query=student_query,
         )
         self._sessions[conversation_id] = session

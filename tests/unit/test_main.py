@@ -85,10 +85,18 @@ class ReplySessionEndpointTests(unittest.TestCase):
         ), patch("main.run_orchestration", new=initial_orchestration), patch(
             "src.agents.orchestrator.run_answer",
             new=revision_generation,
+        ), patch(
+            "main.save_accepted_qna",
+            new=AsyncMock(),
         ):
             client = TestClient(app)
             created = client.post(
-                "/reply-sessions", json={"question": "What is due?"}
+                "/reply-sessions",
+                json={
+                    "question": "What is due?",
+                    "course_id": "course-1",
+                    "user_id": "student-1",
+                },
             )
             generated = client.post("/reply-sessions/conv_1/generate")
             reviewed = client.post(
@@ -110,6 +118,32 @@ class ReplySessionEndpointTests(unittest.TestCase):
         self.assertEqual(revision_call.kwargs["conversation_id"], "conv_1")
         self.assertTrue(revision_call.kwargs["is_revision"])
         self.assertIn("Make it friendlier.", revision_call.kwargs["session_context"])
+
+    def test_failed_cosmos_write_does_not_mark_session_accepted(self):
+        store = ReplySessionStore()
+
+        async def arrange_session():
+            with patch(
+                "src.reply_sessions.create_conversation",
+                new=AsyncMock(return_value="conv_1"),
+            ):
+                await store.create("What is due?", "course-1")
+            store.save_generation("conv_1", "Friday.")
+
+        import asyncio
+
+        asyncio.run(arrange_session())
+        with patch("main.reply_sessions", store), patch(
+            "main.save_accepted_qna",
+            new=AsyncMock(side_effect=RuntimeError("Cosmos unavailable")),
+        ), patch("main.logger.exception"):
+            response = TestClient(app).post("/reply-sessions/conv_1/accept")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            store.get("conv_1").status.value,
+            "awaiting_review",
+        )
 
 
 if __name__ == "__main__":

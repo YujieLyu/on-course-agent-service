@@ -2,11 +2,9 @@ from pathlib import Path
 from string import Template
 from typing import TypeVar
 
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI
 from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response_input_param import ResponseInputParam
-from azure.core.credentials import AzureKeyCredential
-from azure.search.documents import SearchClient
 from pydantic import BaseModel
 
 from src.config import load_openai_settings
@@ -18,13 +16,6 @@ PROMPT_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 def load_system_prompt(agent_name: str) -> Template:
     prompt_path = PROMPT_ROOT / agent_name / "system.md"
     return Template(prompt_path.read_text())
-
-def create_search_client(search_settings:dict)-> SearchClient:
-    return SearchClient(
-            endpoint=search_settings["endpoint"],
-            index_name=search_settings["index_name"],
-            credential=AzureKeyCredential(search_settings["api_key"]),
-        )
 
 def create_llm_client(client_type: ClientType) -> AsyncOpenAI:
     match client_type:

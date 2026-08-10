@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "azure-core>=1.41.0",
+    "azure-cosmos>=4.14.0",
     "azure-search-documents>=12.0.0",
     "fastapi[standard]>=0.141.1",
     "openai>=2.52.0",

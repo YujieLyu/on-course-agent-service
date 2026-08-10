@@ -102,6 +102,8 @@ class Revision(StrictModel):
 
 class ReplySession(StrictModel):
     conversation_id: str
+    course_id: str = Field(min_length=1)
+    user_id: str | None = None
     student_query: str = Field(min_length=1)
     status: SessionStatus = SessionStatus.PENDING_GENERATION
     revisions: list[Revision] = Field(default_factory=list)
@@ -109,6 +111,8 @@ class ReplySession(StrictModel):
 
 class CreateReplySessionRequest(StrictModel):
     question: str = Field(min_length=1)
+    course_id: str = Field(min_length=1)
+    user_id: str | None = None
 
 
 class ReviewReplySessionRequest(StrictModel):

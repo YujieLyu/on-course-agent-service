@@ -21,9 +21,10 @@ class ReplySessionStoreTests(unittest.IsolatedAsyncioTestCase):
             "src.reply_sessions.create_conversation",
             new=AsyncMock(return_value="conv_1"),
         ):
-            session = await store.create("What is due?")
+            session = await store.create("What is due?", "course-1", "student-1")
 
         self.assertEqual(session.status, SessionStatus.PENDING_GENERATION)
+        self.assertEqual(session.course_id, "course-1")
         self.assertEqual(session.revisions, [])
 
         session = store.save_generation("conv_1", "The report is due Friday.")
@@ -51,7 +52,7 @@ class ReplySessionStoreTests(unittest.IsolatedAsyncioTestCase):
             "src.reply_sessions.create_conversation",
             new=AsyncMock(return_value="conv_1"),
         ):
-            await store.create("What is due?")
+            await store.create("What is due?", "course-1")
 
         with self.assertRaises(InvalidSessionActionError):
             store.request_revision("conv_1", "Change it.")

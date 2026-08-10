@@ -1,5 +1,3 @@
-import asyncio
-
 from src.agents.intent_classifier import intent_classify
 from src.agents.reply_agent import run_answer
 from src.config import get_model_name
@@ -8,7 +6,6 @@ from src.models import (
     ReplyRequest,
     ReplyResponse,
     ReplySession,
-    SearchResult,
     SessionStatus,
 )
 from src.reply_sessions import InvalidSessionActionError, ReplySessionStore
@@ -36,12 +33,13 @@ async def run_orchestration(
     # arrange search - agent
     search_query = intent_response.search_query or request.question
 
-    search_results: list[SearchResult] = []
-    search_responses = await asyncio.gather(
-        *(search(search_query, search_source) for search_source in intent_response.search_sources)
-    )
-    for search_response in search_responses:
-        search_results.extend(search_response.results)
+    search_results = (
+        await search(
+            search_query,
+            intent_response.search_sources,
+            request.course_id,
+        )
+    ).results
     # 
     # answer question -agent
     response = await run_answer(

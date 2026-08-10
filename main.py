@@ -11,6 +11,7 @@ from src.models import (
     ReviewReplySessionRequest,
     SessionStatus,
 )
+from src.services.historical_qna import save_accepted_qna
 from src.reply_sessions import (
     InvalidSessionActionError,
     ReplySessionStore,
@@ -44,7 +45,11 @@ async def generate_reply(request: ReplyRequest, response: Response) -> ReplyResp
 @app.post("/reply-sessions", response_model=ReplySession, status_code=201)
 async def create_reply_session(request: CreateReplySessionRequest) -> ReplySession:
     try:
-        return await reply_sessions.create(request.question)
+        return await reply_sessions.create(
+            request.question,
+            request.course_id,
+            request.user_id,
+        )
     except Exception:
         logger.exception("Failed to create reply session")
         raise HTTPException(status_code=503, detail="The service could not create a session")
@@ -68,8 +73,8 @@ async def generate_session_reply(conversation_id: str) -> ReplySession:
             response = await run_orchestration(
                 ReplyRequest(
                     question=session.student_query,
-                    user_id=conversation_id,
-                    course_id="reply-session",
+                    user_id=session.user_id or conversation_id,
+                    course_id=session.course_id,
                 ),
                 session_context=session.model_dump_json(),
                 conversation_id=conversation_id,
@@ -98,10 +103,17 @@ def review_reply_session(
 
 
 @app.post("/reply-sessions/{conversation_id}/accept", response_model=ReplySession)
-def accept_reply_session(conversation_id: str) -> ReplySession:
+async def accept_reply_session(conversation_id: str) -> ReplySession:
     try:
+        session = reply_sessions.get(conversation_id)
+        if session.status != SessionStatus.AWAITING_REVIEW:
+            raise InvalidSessionActionError("Session is not awaiting review")
+        await save_accepted_qna(session)
         return reply_sessions.accept(conversation_id)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
     except InvalidSessionActionError as error:
         raise HTTPException(status_code=409, detail=str(error))
+    except Exception:
+        logger.exception("Failed to persist accepted historical Q&A")
+        raise HTTPException(status_code=503, detail="The service could not accept the reply")
