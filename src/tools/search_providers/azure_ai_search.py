@@ -32,7 +32,7 @@ async def search(query: str, course_id: str) -> SearchResults:
     semantic_config_name = settings["semantic_config_name"]
     if semantic_config_name:
         search_kwargs["query_type"] = "semantic"
-        search_kwargs["semantic_config_name"] = semantic_config_name
+        search_kwargs["semantic_configuration_name"] = semantic_config_name
     else:
         search_kwargs["query_type"] = "simple"
 

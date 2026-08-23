@@ -56,6 +56,39 @@ class AzureSearchHybridSearchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, SearchResults(query="question", results=[]))
 
+    async def test_uses_sdk_semantic_configuration_argument(self):
+        search_client = unittest.mock.MagicMock()
+        search_client.search.return_value = []
+        search_settings = {
+            "keyword_fields": ["content"],
+            "semantic_config_name": "course-semantic-config",
+            "source_field": "source",
+            "text_field": "content",
+            "top_k": 3,
+            "vector_field": "content_vector",
+        }
+        with patch.object(
+            azure_ai_search,
+            "generate_embedding",
+            new=AsyncMock(return_value=[0.1, 0.2]),
+        ), patch.object(
+            azure_ai_search,
+            "create_search_client",
+            return_value=search_client,
+        ), patch.object(
+            azure_ai_search,
+            "_get_settings",
+            return_value=search_settings,
+        ):
+            await azure_ai_search.search("question", "course-1")
+
+        kwargs = search_client.search.call_args.kwargs
+        self.assertEqual(
+            kwargs["semantic_configuration_name"],
+            "course-semantic-config",
+        )
+        self.assertNotIn("semantic_config_name", kwargs)
+
     async def test_combines_each_selected_source_once(self):
         course_result = SearchResult(
             source=SearchSource.COURSE_MATERIALS,

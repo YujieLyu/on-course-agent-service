@@ -1,6 +1,10 @@
 from src.agents.context import format_conversation_context
 from src.models import ChatMessage, IntentClassification, ReplyResponse, SearchResult
-from src.workflow.llm import load_system_prompt, request_structured_output
+from src.workflow.llm import (
+    load_system_prompt,
+    request_structured_output,
+    supports_provider_conversation,
+)
 
 
 async def run_answer(
@@ -16,16 +20,18 @@ async def run_answer(
 ) -> ReplyResponse:
     system_prompt = load_system_prompt("reply_agent")
     formatted_retrieved_context = _format_retrieved_context(retrieved_context or [])
+    has_session = conversation_id is not None
+    has_provider_conversation = supports_provider_conversation(conversation_id)
     instructions = system_prompt.substitute(
         conversation_context=format_conversation_context(chat_history or []),
         retrieved_context=(
-            "Use the authoritative context stored in the conversation's developer input."
-            if conversation_id
+            "Use the authoritative context provided in this request or its reply session."
+            if has_session
             else formatted_retrieved_context
         ),
         session_context=(
-            "Provided in the current conversation user input."
-            if conversation_id
+            "Provided in the current request input."
+            if has_session
             else session_context or "No active reply session."
         ),
     )
@@ -41,12 +47,12 @@ async def run_answer(
                 retrieved_context=formatted_retrieved_context,
                 is_revision=is_revision,
             )
-            if conversation_id
+            if has_session
             else query
         ),
         output_type=ReplyResponse,
         request_name="Answer agent",
-        conversation_id=conversation_id,
+        conversation_id=conversation_id if has_provider_conversation else None,
     )
 
 

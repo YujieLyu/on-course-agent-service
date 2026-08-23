@@ -35,8 +35,7 @@ class ReplySessionStore:
         return deepcopy(session)
 
     def get(self, conversation_id: str) -> ReplySession:
-        try:
-            return deepcopy(self._sessions[conversation_id])
+        try:            return deepcopy(self._sessions[conversation_id])
         except KeyError as error:
             raise SessionNotFoundError(conversation_id) from error
 

@@ -1,17 +1,21 @@
 from pathlib import Path
 from string import Template
 from typing import TypeVar
+from uuid import uuid4
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, NotFoundError
 from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response_input_param import ResponseInputParam
 from pydantic import BaseModel
 
 from src.config import load_openai_settings
+from src.logger import get_logger
 from src.models import ClientType
 
 StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
 PROMPT_ROOT = Path(__file__).resolve().parent.parent / "prompts"
+LOCAL_CONVERSATION_PREFIX = "local_"
+logger = get_logger(__name__)
 
 def load_system_prompt(agent_name: str) -> Template:
     prompt_path = PROMPT_ROOT / agent_name / "system.md"
@@ -88,5 +92,20 @@ async def request_structured_output(
 
 
 async def create_conversation() -> str:
-    conversation = await create_openai_client().conversations.create()
-    return conversation.id
+    try:
+        conversation = await create_openai_client().conversations.create()
+        return conversation.id
+    except NotFoundError:
+        conversation_id = f"{LOCAL_CONVERSATION_PREFIX}{uuid4().hex}"
+        logger.warning(
+            "The configured LLM endpoint does not support Conversations; "
+            "using process-local session context"
+        )
+        return conversation_id
+
+
+def supports_provider_conversation(conversation_id: str | None) -> bool:
+    return bool(
+        conversation_id
+        and not conversation_id.startswith(LOCAL_CONVERSATION_PREFIX)
+    )
