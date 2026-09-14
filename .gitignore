@@ -10,3 +10,7 @@ wheels/
 .venv
 
 .env
+
+# Raw and not-yet-human-reviewed evaluation data
+eval/SMNA-sent-matched.csv
+eval/processed/

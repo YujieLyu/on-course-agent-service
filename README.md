@@ -80,6 +80,10 @@ AZURE_COSMOS_EMBEDDING_DIMENSIONS=1536
 
 # Optional logging overrides
 LOG_LEVEL=INFO
+LOG_FORMAT=json
+
+# Total execution deadline for each MCP tool call, in seconds
+MCP_TOOL_TIMEOUT_SECONDS=120
 ```
 
 If the endpoint uses deployment names, set the model variables to those
@@ -125,7 +129,113 @@ For a production-style local process without reload:
 uv run fastapi run main.py --host 0.0.0.0 --port 8000
 ```
 
+## MCP server
+
+The project includes a local STDIO MCP server that exposes the reply and review
+APIs as model-callable tools. It calls the FastAPI application in process, so a
+separate HTTP server does not need to be running.
+
+The available tools are:
+
+- `answer_student_question`
+- `create_reply_session`
+- `get_reply_session`
+- `generate_session_reply`
+- `request_reply_revision`
+- `accept_reply_session`
+
+Run the server directly:
+
+```bash
+uv run python mcp_server.py
+```
+
+To register it with Codex from the repository root:
+
+```bash
+codex mcp add on-course-agent -- \
+  uv --directory "$PWD" run python mcp_server.py
+```
+
+Confirm that Codex can discover it:
+
+```bash
+codex mcp list
+```
+
+The MCP process loads the same `.env` configuration as the FastAPI service.
+Generating replies therefore requires the same OpenAI and retrieval settings
+described in [Setup](#setup). Reply sessions remain in memory and last only for
+the lifetime of the MCP process.
+
+Tool schemas describe the same chat messages, replies, citations, and sessions
+as the HTTP API. A history message requires `role` (`user` or `assistant`) and
+nonempty `content`; `created_at` is optional. Pass returned conversation IDs
+unchanged. MCP session tools accept letters, digits, underscores, and hyphens;
+URL paths, query strings, and encoded URL fragments are rejected before execution.
+
+`MCP_TOOL_TIMEOUT_SECONDS` sets a finite, positive execution deadline for each
+tool call (default: 120 seconds). The deadline cancels the awaiting operation and
+returns a tool error with a request ID. There are no automatic retries. An
+external request or synchronous database write already running in a worker
+thread can still finish after cancellation. Check session status before retrying
+a write; a timeout does not prove that a remote write was rolled back.
+
+To evaluate Streamable HTTP locally using the same tools:
+
+```bash
+uv run fastmcp run mcp_server.py:mcp --transport http --host 127.0.0.1 --port 8001
+```
+
+Use the `/mcp` endpoint on that port. A shared deployment still needs
+authentication, course/session authorization, and durable session storage.
+Separate FastAPI and MCP processes do not share in-memory sessions. Acceptance
+should only be called after explicit teacher approval; the tool description is
+guidance to the calling agent, not an authorization check.
+
+## Observability
+
+Application logs are JSON lines on stderr by default, keeping stdout available
+for the STDIO MCP protocol. `LOG_LEVEL` controls verbosity; `LOG_FORMAT=text`
+selects readable text with structured fields appended. Existing custom Python
+logging format strings are also supported. FastMCP's transport startup messages
+may use its own stderr format.
+
+HTTP requests accept an optional `X-Request-ID` and return it on handled
+responses. IDs must contain 1–128 letters, digits, dots, underscores, or hyphens;
+otherwise a new ID is generated. Each MCP tool invocation gets a new request ID
+that is passed into the internal HTTP request and carried through asynchronous
+work and worker threads. Request IDs correlate logs; they do not authenticate
+callers.
+
+Events include:
+
+- `mcp.tool.*` and `http.request.*`: tool or route, duration, HTTP status, and
+  completion, rejection, timeout, or cancellation outcome.
+- `reply.*`, `retrieval.*`, and `llm.*`: routing decisions, source/result counts,
+  model calls, token usage when available, and stage durations. Skipped public
+  policy pages produce a warning with their configured page index.
+- `session.transition`: conversation/course ID, previous and next status, and
+  revision number.
+- `cosmos.qna.*`: database search/write duration, outcome, and result counts.
+
+Application events omit questions, chat history, generated answers, retrieved
+content, credentials, and raw HTTP URLs. Failure logs retain the exception type
+and stack locations without exception messages or local variables, since
+provider errors can contain submitted data. FastMCP argument-validation logs
+are sanitized for the same reason. Independently configured SDK debug logs and
+web-server access logs are outside this application logging policy.
+
+For a slow or failed call, find its `request_id`, then inspect stage durations
+and the last failure/cancellation event. Session transitions distinguish a
+generated draft from an accepted answer; Cosmos write events show persistence
+attempts.
+
 ## API usage
+
+For frontend integration, see the [API contract](docs/api-contract.md) for wire
+types, session transitions, errors, and client examples. The accompanying
+[OpenAPI snapshot](docs/openapi.json) can be imported into API tooling.
 
 ### Generate a reply directly
 
