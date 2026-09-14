@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -9,6 +10,21 @@ from src.tools.search_providers import historical_qna_search
 
 
 class HistoricalQnaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_container_initialization_and_write_run_off_event_loop(self):
+        event_loop_thread = threading.get_ident()
+        worker_threads = []
+        container = Mock()
+
+        def get_container():
+            worker_threads.append(threading.get_ident())
+            return container
+
+        with patch.object(historical_qna_repository, "_get_container", side_effect=get_container):
+            await historical_qna_repository.upsert_accepted_qna({"id": "conv-1", "course_id": "c1"})
+        self.assertNotEqual(worker_threads, [event_loop_thread])
+        self.assertEqual(len(worker_threads), 1)
+        container.upsert_item.assert_called_once()
+
     async def test_save_uses_conversation_id_for_idempotent_upsert(self):
         session = ReplySession(
             conversation_id="conv-1",

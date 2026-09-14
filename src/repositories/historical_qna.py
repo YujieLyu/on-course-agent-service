@@ -5,6 +5,9 @@ from typing import Any
 from azure.cosmos import CosmosClient
 
 from src.config import load_cosmos_qna_settings
+from src.logger import get_logger, log_operation
+
+logger = get_logger(__name__)
 
 
 @cache
@@ -16,7 +19,12 @@ def _get_container() -> Any:
 
 
 async def upsert_accepted_qna(item: dict[str, Any]) -> None:
-    await asyncio.to_thread(_get_container().upsert_item, item)
+    with log_operation(
+        logger, "cosmos.qna.upsert", conversation_id=item["id"], course_id=item["course_id"],
+    ):
+        # Container initialization can perform I/O too; keep it off the event
+        # loop so an MCP deadline can cancel the awaiting request promptly.
+        await asyncio.to_thread(lambda: _get_container().upsert_item(item))
 
 
 async def search_accepted_qna(
@@ -39,12 +47,15 @@ async def search_accepted_qna(
         {"name": "@embedding", "value": query_vector},
         {"name": "@course_id", "value": course_id},
     ]
-    return await asyncio.to_thread(
-        lambda: list(
-            _get_container().query_items(
-                query=sql,
-                parameters=parameters,
-                partition_key=course_id,
+    with log_operation(logger, "cosmos.qna.search", course_id=course_id) as event:
+        items = await asyncio.to_thread(
+            lambda: list(
+                _get_container().query_items(
+                    query=sql,
+                    parameters=parameters,
+                    partition_key=course_id,
+                )
             )
         )
-    )
+        event["result_count"] = len(items)
+        return items
