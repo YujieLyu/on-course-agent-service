@@ -10,8 +10,16 @@ Integration tests mock only external boundaries:
 - OpenAI client calls
 - Azure AI Search client calls
 - Public website HTTP requests
+- Cosmos DB container operations
 
 No integration test sends network traffic or consumes paid API capacity.
+
+MCP coverage includes typed tool discovery, the complete review workflow,
+Streamable HTTP through an in-process ASGI transport, and a real STDIO subprocess.
+Regression tests cover conversation-ID route injection, invalid chat history,
+execution deadlines and cancellation, sanitized errors, request correlation,
+and payload-free logging. HTTP and MCP tests replace external dependencies;
+the STDIO smoke test only discovers tools and requests a missing session.
 
 Run unit tests:
 

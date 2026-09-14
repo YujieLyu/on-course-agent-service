@@ -1,7 +1,20 @@
 from copy import deepcopy
 
+from src.logger import get_logger
 from src.models import ReplySession, Revision, SessionStatus
 from src.workflow.llm import create_conversation
+
+logger = get_logger(__name__)
+
+
+def _log_transition(session: ReplySession, previous_status: SessionStatus | None) -> None:
+    logger.info("session.transition", extra={"event_fields": {
+        "conversation_id": session.conversation_id,
+        "course_id": session.course_id,
+        "previous_status": previous_status,
+        "session_status": session.status,
+        "revision_number": len(session.revisions),
+    }})
 
 
 class SessionNotFoundError(KeyError):
@@ -32,10 +45,12 @@ class ReplySessionStore:
             student_query=student_query,
         )
         self._sessions[conversation_id] = session
+        _log_transition(session, None)
         return deepcopy(session)
 
     def get(self, conversation_id: str) -> ReplySession:
-        try:            return deepcopy(self._sessions[conversation_id])
+        try:
+            return deepcopy(self._sessions[conversation_id])
         except KeyError as error:
             raise SessionNotFoundError(conversation_id) from error
 
@@ -50,10 +65,12 @@ class ReplySessionStore:
             )
         )
         session.status = SessionStatus.REVISION_REQUESTED
+        _log_transition(session, SessionStatus.AWAITING_REVIEW)
         return deepcopy(session)
 
     def save_generation(self, conversation_id: str, content: str) -> ReplySession:
         session = self._get_mutable(conversation_id)
+        previous_status = session.status
         if session.status == SessionStatus.PENDING_GENERATION:
             session.revisions.append(
                 Revision(revision_number=1, revision_content=content)
@@ -63,6 +80,7 @@ class ReplySessionStore:
         else:
             raise InvalidSessionActionError("Session is not ready for generation")
         session.status = SessionStatus.AWAITING_REVIEW
+        _log_transition(session, previous_status)
         return deepcopy(session)
 
     def accept(self, conversation_id: str) -> ReplySession:
@@ -70,6 +88,7 @@ class ReplySessionStore:
         if session.status != SessionStatus.AWAITING_REVIEW:
             raise InvalidSessionActionError("Session is not awaiting review")
         session.status = SessionStatus.ACCEPTED
+        _log_transition(session, SessionStatus.AWAITING_REVIEW)
         return deepcopy(session)
 
     def _get_mutable(self, conversation_id: str) -> ReplySession:

@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException, Response, status
 
 from src.agents.orchestrator import generate_session_revision, run_orchestration
 from src.logger import get_logger
+from src.observability import RequestLoggingMiddleware
 from src.models import (
     CreateReplySessionRequest,
     ReplyRequest,
@@ -19,6 +20,7 @@ from src.reply_sessions import (
 )
 
 app = FastAPI()
+app.add_middleware(RequestLoggingMiddleware)
 logger = get_logger(__name__)
 reply_sessions = ReplySessionStore()
 
@@ -51,7 +53,10 @@ async def create_reply_session(request: CreateReplySessionRequest) -> ReplySessi
             request.user_id,
         )
     except Exception:
-        logger.exception("Failed to create reply session")
+        logger.exception(
+            "Failed to create reply session",
+            extra={"event_fields": {"course_id": request.course_id}},
+        )
         raise HTTPException(status_code=503, detail="The service could not create a session")
 
 
@@ -86,7 +91,10 @@ async def generate_session_reply(conversation_id: str) -> ReplySession:
     except InvalidSessionActionError as error:
         raise HTTPException(status_code=409, detail=str(error))
     except Exception:
-        logger.exception("Failed to generate session reply")
+        logger.exception(
+            "Failed to generate session reply",
+            extra={"event_fields": {"conversation_id": conversation_id}},
+        )
         raise HTTPException(status_code=503, detail="The service could not generate a reply")
 
 
@@ -115,5 +123,8 @@ async def accept_reply_session(conversation_id: str) -> ReplySession:
     except InvalidSessionActionError as error:
         raise HTTPException(status_code=409, detail=str(error))
     except Exception:
-        logger.exception("Failed to persist accepted historical Q&A")
+        logger.exception(
+            "Failed to persist accepted historical Q&A",
+            extra={"event_fields": {"conversation_id": conversation_id}},
+        )
         raise HTTPException(status_code=503, detail="The service could not accept the reply")

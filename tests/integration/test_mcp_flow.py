@@ -1,0 +1,101 @@
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+from fastmcp import Client
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+from main import app
+from mcp_server import create_mcp_server
+from src.models import IntentClassification, ReplyResponse, StudentIntent
+from src.reply_sessions import ReplySessionStore
+from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client
+
+
+class McpFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_workflow_through_api_and_external_boundaries(self):
+        classification = IntentClassification(
+            intent=StudentIntent.OUT_OF_SCOPE,
+            search_sources=[], needs_clarification=False,
+        )
+        initial = ReplyResponse(reply="Initial answer", status="answered", citations=[])
+        revision = ReplyResponse(reply="Revised answer", status="answered", citations=[])
+        llm = fake_llm_client(classification, initial, classification, initial, revision)
+        llm.conversations = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(id="conv-workflow")))
+        container = Mock()
+        settings = {"embedding_dimensions": 3}
+
+        with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", ReplySessionStore()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.services.historical_qna.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
+            async with Client(create_mcp_server(app)) as client:
+                answer = await client.call_tool("answer_student_question", {
+                    "question": "Question", "course_id": "course-1", "user_id": "student-1",
+                })
+                self.assertEqual(answer.structured_content, initial.model_dump(mode="json"))
+                created = await client.call_tool("create_reply_session", {"question": "Question", "course_id": "course-1"})
+                conversation_id = created.structured_content["conversation_id"]
+                args = {"conversation_id": conversation_id}
+                generated = await client.call_tool("generate_session_reply", args)
+                self.assertEqual(generated.structured_content["status"], "awaiting_review")
+                await client.call_tool("request_reply_revision", {**args, "feedback": "Shorter"})
+                revised = await client.call_tool("generate_session_reply", args)
+                self.assertEqual(revised.structured_content["revisions"][-1]["revision_content"], "Revised answer")
+                await client.call_tool("accept_reply_session", args)
+                final = await client.call_tool("get_reply_session", args)
+                self.assertEqual(final.structured_content["status"], "accepted")
+                conflict = await client.call_tool("generate_session_reply", args, raise_on_error=False)
+                self.assertTrue(conflict.is_error)
+                self.assertIn("HTTP 409", conflict.content[0].text)
+
+        container.upsert_item.assert_called_once()
+        item = container.upsert_item.call_args.args[0]
+        self.assertEqual(item["accepted_response"], "Revised answer")
+        self.assertEqual(item["id"], conversation_id)
+        self.assertEqual(llm.responses.parse.await_count, 5)
+
+    async def test_streamable_http_discovers_and_calls_typed_tools(self):
+        server = create_mcp_server(app)
+        http_app = server.http_app(path="/mcp", stateless_http=True, json_response=True)
+        answer = ReplyResponse(reply="HTTP answer", status="answered", citations=[])
+        headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25"}
+        with patch("main.run_orchestration", new=AsyncMock(return_value=answer)):
+            async with http_app.router.lifespan_context(http_app):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=http_app), base_url="http://mcp.test", headers=headers) as client:
+                    initialized = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"},
+                    }})
+                    self.assertEqual(initialized.status_code, 200)
+                    discovered = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                    self.assertEqual(len(discovered.json()["result"]["tools"]), 6)
+                    result = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                        "name": "answer_student_question", "arguments": {"question": "Question", "course_id": "c1", "user_id": "u1"},
+                    }})
+                    self.assertEqual(result.json()["result"]["structuredContent"], answer.model_dump(mode="json"))
+
+    async def test_stdio_process_keeps_protocol_and_logs_separate(self):
+        root = Path(__file__).resolve().parents[2]
+        params = StdioServerParameters(
+            command=sys.executable, args=[str(root / "mcp_server.py")], cwd=str(root),
+            env={"LOG_FORMAT": "json", "LOG_LEVEL": "INFO"},
+        )
+        with tempfile.TemporaryFile(mode="w+") as stderr:
+            async with asyncio.timeout(15):
+                async with stdio_client(params, errlog=stderr) as (reader, writer):
+                    async with ClientSession(reader, writer) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        self.assertEqual(len(tools.tools), 6)
+                        failed = await session.call_tool("get_reply_session", {"conversation_id": "missing"})
+                        self.assertTrue(failed.isError)
+                        self.assertIn("HTTP 404", failed.content[0].text)
+            stderr.seek(0)
+            events = [json.loads(line) for line in stderr if line.startswith("{")]
+        self.assertTrue(any(event["event"] == "mcp.tool.started" for event in events))
+        self.assertTrue(any(event.get("status_code") == 404 for event in events))

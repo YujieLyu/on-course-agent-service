@@ -9,7 +9,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
 from pydantic import BaseModel
 
 from src.config import load_openai_settings
-from src.logger import get_logger
+from src.logger import get_logger, log_operation
 from src.models import ClientType
 
 StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
@@ -83,25 +83,28 @@ async def request_structured_output(
     )
     if conversation_id is not None:
         request["conversation"] = conversation_id
-    response = await client.responses.parse(**request)
-    return parse_structured_response(
-        response,
-        output_type,
-        request_name=request_name,
-    )
+    with log_operation(logger, "llm.response", model=model, request_name=request_name) as event:
+        response = await client.responses.parse(**request)
+        result = parse_structured_response(response, output_type, request_name=request_name)
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            for field in ("input_tokens", "output_tokens", "total_tokens"):
+                value = getattr(usage, field, None)
+                if isinstance(value, int):
+                    event[field] = value
+        return result
 
 
 async def create_conversation() -> str:
-    try:
-        conversation = await create_openai_client().conversations.create()
-        return conversation.id
-    except NotFoundError:
-        conversation_id = f"{LOCAL_CONVERSATION_PREFIX}{uuid4().hex}"
-        logger.warning(
-            "The configured LLM endpoint does not support Conversations; "
-            "using process-local session context"
-        )
-        return conversation_id
+    with log_operation(logger, "llm.conversation.create") as event:
+        try:
+            conversation = await create_openai_client().conversations.create()
+            return conversation.id
+        except NotFoundError:
+            event["outcome"] = "local_fallback"
+            conversation_id = f"{LOCAL_CONVERSATION_PREFIX}{uuid4().hex}"
+            logger.warning("llm.conversation.local_fallback")
+            return conversation_id
 
 
 def supports_provider_conversation(conversation_id: str | None) -> bool:

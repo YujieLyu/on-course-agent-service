@@ -7,9 +7,12 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from src.config import load_public_website_search_settings
+from src.logger import get_logger
 from src.models import SearchResult, SearchResults, SearchSource
 from src.services.embeddings import generate_embedding
 from src.utils.vectors import cosine_similarity
+
+logger = get_logger(__name__)
 
 
 async def search(query: str, course_id: str) -> SearchResults:
@@ -18,7 +21,7 @@ async def search(query: str, course_id: str) -> SearchResults:
     query_embedding = await generate_embedding(query)
     chunks: list[tuple[float, SearchResult]] = []
 
-    for url in settings["public_website_urls"]:
+    for page_index, url in enumerate(settings["public_website_urls"]):
         try:
             html = await asyncio.to_thread(_fetch_webpage, url)
             title = _extract_title(html) or urlparse(url).netloc or url
@@ -38,7 +41,10 @@ async def search(query: str, course_id: str) -> SearchResults:
                         ),
                     )
                 )
-        except (HTTPError, URLError, TimeoutError, ValueError):
+        except (HTTPError, URLError, TimeoutError, ValueError) as error:
+            logger.warning("retrieval.page.skipped", extra={"event_fields": {
+                "page_index": page_index, "error_type": type(error).__name__,
+            }})
             continue
 
     chunks.sort(key=lambda item: item[0], reverse=True)

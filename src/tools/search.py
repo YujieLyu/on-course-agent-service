@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from src.logger import get_logger, log_operation
 from src.models import SearchResults, SearchSource
 from src.tools.search_providers import (
     azure_ai_search,
@@ -11,6 +12,16 @@ from src.tools.search_providers import (
 
 
 SearchMethod = Callable[[str, str], Awaitable[SearchResults]]
+logger = get_logger(__name__)
+
+
+async def _run_source(
+    source: SearchSource, method: SearchMethod, query: str, course_id: str,
+) -> SearchResults:
+    with log_operation(logger, "retrieval.source", source=source, course_id=course_id) as event:
+        response = await method(query, course_id)
+        event["result_count"] = len(response.results)
+        return response
 
 
 async def _search_course_materials(query: str, course_id: str) -> SearchResults:
@@ -47,7 +58,7 @@ async def search(
     This is the only search entry point intended for callers outside this package.
     Unknown source values are ignored.
     """
-    methods: list[SearchMethod] = []
+    methods: list[tuple[SearchSource, SearchMethod]] = []
     selected_sources: set[SearchSource] = set()
     for search_source in search_sources:
         try:
@@ -57,9 +68,15 @@ async def search(
 
         method = _SEARCH_METHODS.get(source)
         if method is not None and source not in selected_sources:
-            methods.append(method)
+            methods.append((source, method))
             selected_sources.add(source)
 
-    responses = await asyncio.gather(*(method(query, course_id) for method in methods))
-    results = [result for response in responses for result in response.results]
-    return SearchResults(query=query, results=results)
+    with log_operation(
+        logger, "retrieval.search", course_id=course_id, source_count=len(methods),
+    ) as event:
+        responses = await asyncio.gather(*(
+            _run_source(source, method, query, course_id) for source, method in methods
+        ))
+        results = [result for response in responses for result in response.results]
+        event["result_count"] = len(results)
+        return SearchResults(query=query, results=results)
