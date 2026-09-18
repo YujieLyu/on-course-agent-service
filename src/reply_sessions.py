@@ -1,7 +1,7 @@
 from copy import deepcopy
 
 from src.logger import get_logger
-from src.models import ReplySession, Revision, SessionStatus
+from src.models import IntentClassification, ReplySession, Revision, SearchResult, SessionStatus
 from src.workflow.llm import create_conversation
 
 logger = get_logger(__name__)
@@ -30,6 +30,9 @@ class ReplySessionStore:
 
     def __init__(self) -> None:
         self._sessions: dict[str, ReplySession] = {}
+        self._evidence_contexts: dict[
+            str, tuple[IntentClassification, list[SearchResult]]
+        ] = {}
 
     async def create(
         self,
@@ -53,6 +56,22 @@ class ReplySessionStore:
             return deepcopy(self._sessions[conversation_id])
         except KeyError as error:
             raise SessionNotFoundError(conversation_id) from error
+
+    def save_evidence_context(
+        self,
+        conversation_id: str,
+        intent: IntentClassification,
+        results: list[SearchResult],
+    ) -> None:
+        """Keep original evidence for independent checks of later revisions."""
+        self._get_mutable(conversation_id)
+        self._evidence_contexts[conversation_id] = deepcopy((intent, results))
+
+    def get_evidence_context(
+        self, conversation_id: str,
+    ) -> tuple[IntentClassification | None, list[SearchResult]]:
+        self._get_mutable(conversation_id)
+        return deepcopy(self._evidence_contexts.get(conversation_id, (None, [])))
 
     def request_revision(self, conversation_id: str, feedback: str) -> ReplySession:
         session = self._get_mutable(conversation_id)

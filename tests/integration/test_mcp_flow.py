@@ -17,7 +17,7 @@ from main import app
 from mcp_server import create_mcp_server
 from src.models import IntentClassification, ReplyResponse, StudentIntent
 from src.reply_sessions import ReplySessionStore
-from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client
+from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client, supported_review
 
 
 class McpFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -28,17 +28,15 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         initial = ReplyResponse(reply="Initial answer", status="answered", citations=[])
         revision = ReplyResponse(reply="Revised answer", status="answered", citations=[])
-        llm = fake_llm_client(classification, initial, classification, initial, revision)
+        llm = fake_llm_client(
+            classification, initial, supported_review(), revision, supported_review(),
+        )
         llm.conversations = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(id="conv-workflow")))
         container = Mock()
         settings = {"embedding_dimensions": 3}
 
         with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", ReplySessionStore()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.services.historical_qna.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
             async with Client(create_mcp_server(app)) as client:
-                answer = await client.call_tool("answer_student_question", {
-                    "question": "Question", "course_id": "course-1", "user_id": "student-1",
-                })
-                self.assertEqual(answer.structured_content, initial.model_dump(mode="json"))
                 created = await client.call_tool("create_reply_session", {"question": "Question", "course_id": "course-1"})
                 conversation_id = created.structured_content["conversation_id"]
                 args = {"conversation_id": conversation_id}
@@ -65,7 +63,9 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         http_app = server.http_app(path="/mcp", stateless_http=True, json_response=True)
         answer = ReplyResponse(reply="HTTP answer", status="answered", citations=[])
         headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25"}
-        with patch("main.run_orchestration", new=AsyncMock(return_value=answer)):
+        with patch("main.reply_sessions", ReplySessionStore()), patch(
+            "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv-http"),
+        ), patch("main.run_orchestration", new=AsyncMock(return_value=answer)):
             async with http_app.router.lifespan_context(http_app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=http_app), base_url="http://mcp.test", headers=headers) as client:
                     initialized = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -73,11 +73,18 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                     }})
                     self.assertEqual(initialized.status_code, 200)
                     discovered = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-                    self.assertEqual(len(discovered.json()["result"]["tools"]), 6)
+                    self.assertEqual(len(discovered.json()["result"]["tools"]), 5)
                     result = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-                        "name": "answer_student_question", "arguments": {"question": "Question", "course_id": "c1", "user_id": "u1"},
+                        "name": "create_reply_session", "arguments": {"question": "Question", "course_id": "c1", "user_id": "u1"},
                     }})
-                    self.assertEqual(result.json()["result"]["structuredContent"], answer.model_dump(mode="json"))
+                    created = result.json()["result"]["structuredContent"]
+                    self.assertEqual(created["status"], "pending_generation")
+                    generated = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                        "name": "generate_session_reply", "arguments": {"conversation_id": created["conversation_id"]},
+                    }})
+                    session = generated.json()["result"]["structuredContent"]
+                    self.assertEqual(session["status"], "awaiting_review")
+                    self.assertEqual(session["revisions"][-1]["revision_content"], answer.reply)
 
     async def test_stdio_process_keeps_protocol_and_logs_separate(self):
         root = Path(__file__).resolve().parents[2]
@@ -91,7 +98,7 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                     async with ClientSession(reader, writer) as session:
                         await session.initialize()
                         tools = await session.list_tools()
-                        self.assertEqual(len(tools.tools), 6)
+                        self.assertEqual(len(tools.tools), 5)
                         failed = await session.call_tool("get_reply_session", {"conversation_id": "missing"})
                         self.assertTrue(failed.isError)
                         self.assertIn("HTTP 404", failed.content[0].text)

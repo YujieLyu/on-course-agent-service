@@ -1,5 +1,6 @@
 from src.agents.context import format_conversation_context
-from src.models import ChatMessage, IntentClassification, ReplyResponse, SearchResult
+from src.agents.evidence_guard import enforce_evidence_guard
+from src.models import ChatMessage, IntentClassification, ReplyResponse, SearchResult, StudentIntent
 from src.workflow.llm import (
     load_system_prompt,
     request_structured_output,
@@ -17,6 +18,7 @@ async def run_answer(
     conversation_id: str | None = None,
     intent_context: IntentClassification | None = None,
     is_revision: bool = False,
+    teacher_feedback: list[str] | None = None,
 ) -> ReplyResponse:
     system_prompt = load_system_prompt("reply_agent")
     formatted_retrieved_context = _format_retrieved_context(retrieved_context or [])
@@ -35,7 +37,7 @@ async def run_answer(
             else session_context or "No active reply session."
         ),
     )
-    return await request_structured_output(
+    response = await request_structured_output(
         client_type=client_type,
         model=model,
         instructions=instructions,
@@ -54,6 +56,18 @@ async def run_answer(
         request_name="Answer agent",
         conversation_id=conversation_id if has_provider_conversation else None,
     )
+    return await enforce_evidence_guard(
+        query=query,
+        response=response,
+        client_type=client_type,
+        model=model,
+        retrieved_context=retrieved_context or [],
+        chat_history=chat_history or [],
+        teacher_feedback=teacher_feedback or [],
+        allow_unreferenced_answer=(
+            intent_context is not None and intent_context.intent == StudentIntent.OUT_OF_SCOPE
+        ),
+    )
 
 
 def _build_input(
@@ -65,13 +79,13 @@ def _build_input(
     is_revision: bool,
 ) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    if intent_context is not None:
+    if intent_context is not None or is_revision:
         items.append(
             {
                 "role": "developer",
                 "content": (
                     "Intent classification:\n"
-                    f"{intent_context.model_dump_json()}\n\n"
+                    f"{intent_context.model_dump_json() if intent_context else 'Not provided.'}\n\n"
                     "Authoritative retrieved context:\n"
                     f"{retrieved_context}"
                 ),
