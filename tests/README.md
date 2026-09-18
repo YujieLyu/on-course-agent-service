@@ -16,8 +16,9 @@ No integration test sends network traffic or consumes paid API capacity.
 
 MCP coverage includes typed tool discovery, the complete review workflow,
 Streamable HTTP through an in-process ASGI transport, and a real STDIO subprocess.
-Regression tests cover conversation-ID route injection, invalid chat history,
-execution deadlines and cancellation, sanitized errors, request correlation,
+Regression tests cover removal of the direct-answer HTTP route and MCP tool,
+repeated revision of generated drafts, retryable generation failures,
+conversation-ID route injection, invalid session input, execution deadlines and cancellation, sanitized errors, request correlation,
 and payload-free logging. HTTP and MCP tests replace external dependencies;
 the STDIO smoke test only discovers tools and requests a missing session.
 

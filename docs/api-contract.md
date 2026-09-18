@@ -2,7 +2,7 @@
 
 This contract describes the implemented HTTP API in `main.py`, the wire models
 in `src/models.py`, and the session behavior in `src/reply_sessions.py` as of
-2026-09-06. It describes current behavior, including integration limitations;
+2026-09-18. It describes current behavior, including integration limitations;
 it does not propose additional endpoints.
 
 ## Connection and conventions
@@ -19,8 +19,7 @@ it does not propose additional endpoints.
 | Identity | `user_id` and `course_id` are caller-supplied data, not verified credentials |
 | CORS | No CORS middleware configured; use a same-origin frontend proxy or configure CORS before cross-origin browser integration |
 | Naming | JSON fields use `snake_case` |
-| Unknown fields | Rejected with HTTP `422` in request models, including nested chat messages |
-| Dates | `created_at` accepts a Pydantic datetime; send an ISO 8601 string with a timezone, e.g. `2026-09-06T08:00:00Z` |
+| Unknown fields | Rejected with HTTP `422` in request models |
 | Pagination | Not applicable; there is no session-list endpoint |
 
 All operations finish within the HTTP request. Generation can involve multiple
@@ -36,12 +35,18 @@ and dependency operations without logging request/response bodies; see the
 
 Machine-readable schema: [openapi.json](openapi.json), exported directly from
 `app.openapi()`. A running service exposes `/openapi.json`, `/docs`, and `/redoc`.
-The export preserves FastAPI's current schema exactly: runtime session errors
-such as `404`, `409`, and `503` are not declared there. The error tables below
-document those additional implemented responses. Check the running service's
-schema when integrating a different revision.
+The export preserves FastAPI's current schema exactly, including the local
+development server URL, operation IDs, route tags, and declared session errors
+such as `404`, `409`, and `503`. Session errors use `HTTPErrorResponse` with a
+string `detail`. Check the running service's schema when integrating a different
+revision.
 
 ## Endpoint summary
+
+Every reply belongs to a session and supports feedback and repeated revision
+before acceptance. The direct `POST /reply` endpoint has been removed. Existing
+clients must create a session with `POST /reply-sessions`, keep its
+`conversation_id`, and call its `/generate` operation.
 
 `{conversation_id}` is an opaque string returned by session creation. URL-encode
 it when building paths. Do not assume a UUID or a particular prefix.
@@ -49,7 +54,6 @@ it when building paths. Do not assume a UUID or a particular prefix.
 | Method | Path | Request body | Success | Known errors |
 | --- | --- | --- | --- | --- |
 | GET | `/health` | None | `200`, JSON string | — |
-| POST | `/reply` | `ReplyRequest` | `200`, `ReplyResponse` | `422`, `503` |
 | POST | `/reply-sessions` | `CreateReplySessionRequest` | `201`, `ReplySession` | `422`, `503` |
 | GET | `/reply-sessions/{conversation_id}` | None | `200`, `ReplySession` | `404` |
 | POST | `/reply-sessions/{conversation_id}/generate` | None | `200`, `ReplySession` | `404`, `409`, `503` |
@@ -66,46 +70,6 @@ Optional request properties may be omitted. Nullable response properties are
 serialized as `null` when unset.
 
 ```ts
-export type ReplyStatus =
-  | "answered"
-  | "needs_clarification"
-  | "not_found"
-  | "escalated"
-  | "error";
-
-export type SearchSource =
-  | "course_materials"
-  | "university_policies"
-  | "historical_qna"
-  | "canvas";
-
-export interface ChatMessage {
-  role: "user" | "assistant";
-  content: string; // Minimum length: 1.
-  created_at?: string | null;
-}
-
-export interface ReplyRequest {
-  question: string; // Minimum length: 1.
-  user_id: string;
-  course_id: string;
-  chat_history?: ChatMessage[]; // Defaults to []; null is invalid.
-}
-
-export interface Citation {
-  source: SearchSource;
-  content: string; // Minimum length: 1.
-  title: string | null;
-  source_url: string | null; // Not validated as a URL by the backend.
-  excerpt: string | null;
-}
-
-export interface ReplyResponse {
-  reply: string;
-  status: ReplyStatus;
-  citations: Citation[];
-}
-
 export type SessionStatus =
   | "pending_generation"
   | "awaiting_review"
@@ -139,70 +103,9 @@ export interface ReplySession {
 ```
 
 The backend does not trim whitespace or impose maximum lengths on these
-strings. For `/reply`, `user_id` and `course_id` are required but may be empty
-strings under the current validator; session creation requires a nonempty
-`course_id`. The frontend should validate meaningful, nonblank user input.
-Only `user` and `assistant` roles are accepted in `chat_history`.
-
-## Direct question answering
-
-### `POST /reply`
-
-Use this endpoint for a student chat interface that needs answer status and RAG
-citations. Supply previous messages in chronological order on each follow-up;
-this endpoint does not return a conversation ID or persist a reply session.
-Send the current question in `question`, and prior turns in `chat_history`.
-
-Request:
-
-```json
-{
-  "question": "When is Assignment 1 due?",
-  "user_id": "student-123",
-  "course_id": "COSC1234-2026-S2",
-  "chat_history": [
-    {"role": "user", "content": "Which assignments are coming up?"},
-    {"role": "assistant", "content": "Assignment 1 is the next assessment."}
-  ]
-}
-```
-
-Illustrative `200` response; answer text and citations depend on retrieved data:
-
-```json
-{
-  "reply": "Assignment 1 is due on Friday at 5 pm.",
-  "status": "answered",
-  "citations": [
-    {
-      "source": "course_materials",
-      "content": "Assignment 1 is due on Friday at 5 pm.",
-      "title": "Assignment 1 brief",
-      "source_url": "https://example.edu/courses/COSC1234/assignment-1",
-      "excerpt": "Due: Friday, 5 pm."
-    }
-  ]
-}
-```
-
-HTTP `200` means orchestration returned a valid response, not necessarily an
-answer. Inspect `status` separately:
-
-| Status | Suggested frontend behavior |
-| --- | --- |
-| `answered` | Display the answer and available citations |
-| `needs_clarification` | Display `reply` as a clarification prompt; send the student's next answer with prior history |
-| `not_found` | Display `reply` as an insufficient-information result |
-| `escalated` | Display the suggested staff follow-up; this status does not itself create a ticket or send a notification |
-| `error` | Display a failure state; this can occur in a valid `200` response as well as the explicit `503` fallback |
-
-`citations` can be empty. There is no citation ID, relevance score, page-number
-field, or guaranteed mapping between inline references in `reply` and array
-indices. Use a fallback label when `title` is null, and only render a link when
-`source_url` is a usable HTTP(S) URL. The response does not declare whether
-`reply` is Markdown; use safe text rendering or sanitized Markdown according to
-the frontend design. Canvas is an allowed source value, but its current search
-provider is a stub returning no results.
+strings. Session creation requires nonempty `question` and `course_id`;
+revision requests require nonempty `feedback`. The frontend should validate
+meaningful, nonblank user input.
 
 ## Teacher review workflow
 
@@ -333,18 +236,6 @@ There is no list, delete, export, chat-message append, or session recovery API.
 
 ## Errors and retry behavior
 
-### Direct-reply dependency failure
-
-`POST /reply` returns HTTP `503` with a `ReplyResponse`, not a `detail` envelope:
-
-```json
-{
-  "reply": "The service could not complete the request.",
-  "status": "error",
-  "citations": []
-}
-```
-
 ### Session errors
 
 Session errors use `{"detail": "..."}`:
@@ -365,7 +256,7 @@ envelope: there is no global custom error handler.
 
 ### Request validation
 
-Missing required fields, forbidden extra fields, invalid roles, null for a
+Missing required fields, forbidden extra fields, null for a
 non-nullable field, and empty strings with a minimum length produce HTTP `422`.
 Representative response for an empty `question`:
 
@@ -404,9 +295,9 @@ Q&A storage uses a deterministic upsert ID internally, but this does not make
 
 ## Minimal frontend request helper
 
-This example distinguishes HTTP failures from a successful reply with an
-answer-level status such as `not_found`. Type parameters describe expected JSON;
-they do not perform runtime schema validation.
+This example creates a reply session, generates a draft, and requests a revision.
+Type parameters describe expected JSON; they do not perform runtime schema
+validation.
 
 ```ts
 export class ApiError extends Error {
@@ -438,18 +329,20 @@ export async function requestJson<T>(
 
 // The base URL may instead be a same-origin proxy prefix configured by the app.
 const baseUrl = "http://127.0.0.1:8000";
-const reply = await requestJson<ReplyResponse>(baseUrl, "/reply", {
-  method: "POST",
-  body: { question: "What is due this week?", user_id: "u1", course_id: "c1" },
-});
-// Inspect reply.status before choosing the UI state.
-
 const created = await requestJson<ReplySession>(baseUrl, "/reply-sessions", {
   method: "POST",
   body: { question: "What is due this week?", course_id: "c1" },
 });
 const sessionPath = `/reply-sessions/${encodeURIComponent(created.conversation_id)}`;
 const generated = await requestJson<ReplySession>(baseUrl, `${sessionPath}/generate`, {
+  method: "POST",
+});
+// Display generated.revisions and collect feedback before requesting a revision.
+const reviewed = await requestJson<ReplySession>(baseUrl, `${sessionPath}/review`, {
+  method: "POST",
+  body: { feedback: "Make the answer shorter." },
+});
+const revised = await requestJson<ReplySession>(baseUrl, `${sessionPath}/generate`, {
   method: "POST",
 });
 ```
@@ -478,5 +371,5 @@ Path("docs/openapi.json").write_text(json.dumps(app.openapi(), indent=2) + "\n")
 PY
 ```
 
-Update this document when runtime behavior changes, especially session state
-transitions and errors that FastAPI does not currently declare in OpenAPI.
+Update this document and the route metadata when runtime behavior changes,
+especially session state transitions and error responses.

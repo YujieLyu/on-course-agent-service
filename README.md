@@ -2,14 +2,14 @@
 
 A FastAPI service that generates grounded answers to student questions. It uses
 an LLM to classify each question, retrieves relevant context from the configured
-sources, and returns a structured answer with citations. It also supports a
-teacher review workflow in which replies can be revised and accepted for reuse
-as historical Q&A.
+sources, and generates a draft in a reply session. Every reply supports teacher
+feedback and repeated revision before acceptance for reuse as historical Q&A.
 
 ## Features
 
 - Intent classification and source selection for student questions
-- Grounded answer generation with structured citations
+- Grounded draft generation with internal citation validation
+- Independent evidence review before a generated reply is returned
 - Hybrid keyword/vector retrieval from Azure AI Search
 - University policy retrieval from configured public web pages
 - Course-scoped historical Q&A retrieval using Azure Cosmos DB vector search
@@ -19,6 +19,31 @@ as historical Q&A.
 Canvas is represented as a search source, but its provider is currently a stub
 and returns no results. Reply sessions are stored in process memory, so they are
 lost when the service restarts and are not shared between workers.
+
+## Evidence guardrail
+
+Replies and session revisions are checked before they are returned. A separate
+review using `REPLY_MODEL_NAME` checks whether the evidence supports every factual
+claim and whether an `answered` reply resolves the question. The service validates
+the review's source IDs and quoted passages, then retains citations from the
+original retrieved sources in the internal answer result. A missing mention of
+an exam is not evidence that the exam does not exist; assignment rubrics do not
+establish exam requirements.
+
+Rejected drafts are replaced with a fixed `not_found` reply and empty citations.
+Drafts already labelled `not_found`, and factual answers with no evidence, use
+this fallback without another model call. Other drafts normally require one
+additional model call, increasing latency and token usage. A review dependency
+failure uses the existing HTTP 503 error path and never releases the unchecked
+draft. Semantic support is still judged by a model and can be misclassified;
+the guardrail does not replace correct course filtering or complete source data.
+
+Session revisions reuse a process-local snapshot of the original retrieval and
+may use explicit factual confirmations from teacher feedback. Previous assistant
+drafts and requests to change tone are not evidence. The public API returns the
+session and its draft texts; internal answer statuses and structured citations
+are not included. The guard logs its decision and reason without logging reply
+text, source passages, or feedback.
 
 ## Prerequisites
 
@@ -120,6 +145,7 @@ uv run fastapi dev main.py
 The service is available at `http://127.0.0.1:8000`. Useful URLs are:
 
 - Health check: `http://127.0.0.1:8000/health`
+- OpenAPI specification: `http://127.0.0.1:8000/openapi.json`
 - Swagger UI: `http://127.0.0.1:8000/docs`
 - ReDoc: `http://127.0.0.1:8000/redoc`
 
@@ -131,13 +157,12 @@ uv run fastapi run main.py --host 0.0.0.0 --port 8000
 
 ## MCP server
 
-The project includes a local STDIO MCP server that exposes the reply and review
-APIs as model-callable tools. It calls the FastAPI application in process, so a
+The project includes a local STDIO MCP server that exposes the reply-session
+API as model-callable tools. It calls the FastAPI application in process, so a
 separate HTTP server does not need to be running.
 
 The available tools are:
 
-- `answer_student_question`
 - `create_reply_session`
 - `get_reply_session`
 - `generate_session_reply`
@@ -168,11 +193,11 @@ Generating replies therefore requires the same OpenAI and retrieval settings
 described in [Setup](#setup). Reply sessions remain in memory and last only for
 the lifetime of the MCP process.
 
-Tool schemas describe the same chat messages, replies, citations, and sessions
-as the HTTP API. A history message requires `role` (`user` or `assistant`) and
-nonempty `content`; `created_at` is optional. Pass returned conversation IDs
-unchanged. MCP session tools accept letters, digits, underscores, and hyphens;
-URL paths, query strings, and encoded URL fragments are rejected before execution.
+Tool schemas describe the same sessions and revision feedback as the HTTP API.
+Create a session, generate its draft, then submit feedback and generate again
+as needed. Pass returned conversation IDs unchanged. MCP session tools accept
+letters, digits, underscores, and hyphens; URL paths, query strings, and encoded
+URL fragments are rejected before execution.
 
 `MCP_TOOL_TIMEOUT_SECONDS` sets a finite, positive execution deadline for each
 tool call (default: 120 seconds). The deadline cancels the awaiting operation and
@@ -237,23 +262,28 @@ For frontend integration, see the [API contract](docs/api-contract.md) for wire
 types, session transitions, errors, and client examples. The accompanying
 [OpenAPI snapshot](docs/openapi.json) can be imported into API tooling.
 
-### Generate a reply directly
+### Import into Postman
 
-```bash
-curl -X POST http://127.0.0.1:8000/reply \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "question": "When is Assignment 1 due?",
-    "user_id": "student-123",
-    "course_id": "COSC1234-2026-S2",
-    "chat_history": []
-  }'
-```
+1. Select **Import** in Postman and choose `docs/openapi.json`, or enter
+   `http://127.0.0.1:8000/openapi.json` while the service is running.
+2. Choose **Specification with a Postman Collection** to view the specification
+   and generate requests for all six API operations.
+3. When generating a collection, select **Tags** for folder organization to group
+   requests under **Health** and **Reply Sessions**.
 
-The response contains `reply`, `status`, and `citations`. Possible status values
-are `answered`, `needs_clarification`, `not_found`, `escalated`, and `error`.
+The specification includes the API title and version, stable operation IDs,
+request and response schemas, and known error responses. Its server URL defaults
+to `http://127.0.0.1:8000`; set the generated collection's base URL to the deployed
+address when calling another environment. Use the running service's specification
+for the latest routes, and regenerate the checked-in snapshot after API changes
+using the [contract maintenance instructions](docs/api-contract.md#maintaining-this-contract).
 
 ### Generate and review a reply
+
+All replies use this session workflow. The direct `POST /reply` endpoint and
+`answer_student_question` MCP tool have been removed; clients must create a
+session and generate its reply. Every generated draft can be revised until it
+is accepted.
 
 Create a session:
 

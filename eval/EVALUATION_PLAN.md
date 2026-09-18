@@ -149,7 +149,7 @@ Fix the dataset, model deployment, generation settings, index snapshot, and judg
 
 ## 7. Layered Evaluation
 
-Do not infer every failure from the final `/reply` output. Evaluate components and end-to-end behaviour separately.
+Do not infer every failure from the final reply-session draft. Evaluate components and end-to-end behaviour separately.
 
 ### 7.1 Data and Privacy Gates
 
