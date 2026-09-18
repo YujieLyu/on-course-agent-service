@@ -20,10 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 from main import app
 from src.logger import get_log_context, get_logger, log_context, log_operation
 from src.models import (
-    ChatMessage,
     CreateReplySessionRequest,
-    ReplyRequest,
-    ReplyResponse,
     ReplySession,
     ReviewReplySessionRequest,
 )
@@ -66,7 +63,7 @@ class ToolExecutionMiddleware(Middleware):
             # Do not put caller-provided arguments or unknown tool names in logs.
             name = context.message.name
             known_names = {
-                "answer_student_question", "create_reply_session", "get_reply_session",
+                "create_reply_session", "get_reply_session",
                 "generate_session_reply", "request_reply_revision", "accept_reply_session",
             }
             with log_operation(
@@ -148,8 +145,8 @@ class OnCourseApi:
 
 
 SERVER_INSTRUCTIONS = (
-    "Answer student questions and manage teacher-reviewed reply sessions. "
-    "For a review workflow, create a session, generate a reply, then either "
+    "Answer every student question through a revisable reply session. "
+    "Create a session, generate a reply, then either "
     "request a revision and generate again, or accept the final reply after "
     "explicit teacher approval. Acceptance persists historical course Q&A. "
     "Use known course/user IDs and preserve returned conversation IDs. "
@@ -174,26 +171,6 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
         middleware=[ToolExecutionMiddleware(timeout_seconds)],
     )
     api = OnCourseApi(api_app)
-
-    @mcp.tool(
-        annotations={"readOnlyHint": True, "openWorldHint": True},
-    )
-    async def answer_student_question(
-        question: NonEmptyString,
-        user_id: str,
-        course_id: str,
-        chat_history: list[ChatMessage] | None = None,
-    ) -> ReplyResponse:
-        """Answer a student question using the configured course sources."""
-        return await api.call(
-            "POST",
-            "/reply",
-            ReplyResponse,
-            ReplyRequest(
-                question=question, user_id=user_id, course_id=course_id,
-                chat_history=chat_history or [],
-            ),
-        )
 
     @mcp.tool(
         annotations={"readOnlyHint": False, "destructiveHint": False},

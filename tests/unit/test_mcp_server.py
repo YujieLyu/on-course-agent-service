@@ -1,5 +1,4 @@
 import asyncio
-import json
 import unittest
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -25,11 +24,6 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                 student_query="When is the assignment due?",
                 status=status,
             ).model_dump(mode="json")
-
-        @api.post("/reply")
-        async def answer(payload: dict[str, Any]):
-            self.requests.append(("POST", "/reply", payload))
-            return {"reply": "Friday.", "status": "answered", "citations": []}
 
         @api.post("/reply-sessions")
         async def create_session(payload: dict[str, Any]):
@@ -72,7 +66,6 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(tools),
             {
-                "answer_student_question",
                 "create_reply_session",
                 "get_reply_session",
                 "generate_session_reply",
@@ -83,16 +76,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tools["get_reply_session"].annotations.readOnlyHint)
         self.assertFalse(tools["accept_reply_session"].annotations.readOnlyHint)
 
-    async def test_maps_answer_and_session_workflow_to_fastapi(self):
+    async def test_maps_session_workflow_to_fastapi(self):
         async with Client(self.server) as client:
-            answer = await client.call_tool(
-                "answer_student_question",
-                {
-                    "question": "When is the assignment due?",
-                    "user_id": "student-1",
-                    "course_id": "course-1",
-                },
-            )
             await client.call_tool(
                 "create_reply_session",
                 {
@@ -117,20 +102,9 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                 {"conversation_id": "conv-1"},
             )
 
-        self.assertEqual(answer.structured_content["reply"], "Friday.")
         self.assertEqual(
             self.requests,
             [
-                (
-                    "POST",
-                    "/reply",
-                    {
-                        "question": "When is the assignment due?",
-                        "user_id": "student-1",
-                        "course_id": "course-1",
-                        "chat_history": [],
-                    },
-                ),
                 (
                     "POST",
                     "/reply-sessions",
@@ -162,43 +136,37 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                     {"conversation_id": "missing"},
                 )
 
-    async def test_schemas_describe_chat_messages_and_responses(self):
+    async def test_schemas_describe_revisable_sessions(self):
         async with Client(self.server) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
-        answer = tools["answer_student_question"]
-        schema = json.dumps(answer.inputSchema)
-        self.assertIn('"role"', schema)
-        self.assertIn('"content"', schema)
-        self.assertIn('"user"', schema)
-        self.assertIn('"assistant"', schema)
-        self.assertEqual(answer.inputSchema["properties"]["question"]["minLength"], 1)
-        self.assertEqual(set(answer.outputSchema["required"]), {"reply", "status", "citations"})
-        self.assertIn("revisions", tools["get_reply_session"].outputSchema["properties"])
+        create = tools["create_reply_session"]
+        self.assertEqual(create.inputSchema["properties"]["question"]["minLength"], 1)
+        self.assertEqual(create.inputSchema["properties"]["course_id"]["minLength"], 1)
+        self.assertEqual(set(create.inputSchema["required"]), {"question", "course_id"})
+        for tool in tools.values():
+            self.assertIn("conversation_id", tool.outputSchema["required"])
+            self.assertIn("revisions", tool.outputSchema["properties"])
         self.assertIn("pattern", tools["generate_session_reply"].inputSchema["properties"]["conversation_id"])
 
-    async def test_typed_history_serializes_datetime_for_api(self):
+    async def test_invalid_session_input_is_rejected_before_api_execution(self):
         async with Client(self.server) as client:
-            await client.call_tool("answer_student_question", {
-                "question": "Next question", "course_id": "course-1", "user_id": "student-1",
-                "chat_history": [{"role": "user", "content": "Earlier question", "created_at": "2026-09-13T00:00:00Z"}],
-            })
-        self.assertEqual(self.requests[0][2]["chat_history"], [{
-            "role": "user", "content": "Earlier question", "created_at": "2026-09-13T00:00:00Z",
-        }])
-
-    async def test_invalid_history_is_rejected_before_api_execution(self):
-        async with Client(self.server) as client:
-            for history in [
-                [{"message": "hello"}],
-                [{"role": "system", "content": "hello"}],
-                [{"role": "user", "content": ""}],
-                [{"role": "user", "content": "hello", "private_field": "secret"}],
+            for payload in [
+                {"question": "", "course_id": "course-1"},
+                {"question": "Question", "course_id": ""},
+                {"question": "Question"},
+                {"question": None, "course_id": "course-1"},
             ]:
-                with self.subTest(history=history):
-                    result = await client.call_tool("answer_student_question", {
-                        "question": "Question", "course_id": "course-1", "user_id": "student-1", "chat_history": history,
-                    }, raise_on_error=False)
+                with self.subTest(payload=payload):
+                    result = await client.call_tool("create_reply_session", payload, raise_on_error=False)
                     self.assertTrue(result.is_error)
+        self.assertEqual(self.requests, [])
+
+    async def test_direct_answer_tool_is_unavailable(self):
+        async with Client(self.server) as client:
+            result = await client.call_tool("answer_student_question", {
+                "question": "Question", "course_id": "course-1", "user_id": "student-1",
+            }, raise_on_error=False)
+        self.assertTrue(result.is_error)
         self.assertEqual(self.requests, [])
 
     async def test_session_ids_cannot_change_any_tool_route(self):
@@ -231,7 +199,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         api = FastAPI()
         cancelled = asyncio.Event()
 
-        @api.post("/reply")
+        @api.post("/reply-sessions/{conversation_id}/generate")
         async def slow_answer():
             try:
                 await asyncio.sleep(10)
@@ -243,9 +211,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
             return ReplySession(conversation_id=conversation_id, course_id="c1", student_query="Question")
 
         async with Client(create_mcp_server(api, timeout_seconds=0.02)) as client:
-            result = await asyncio.wait_for(client.call_tool("answer_student_question", {
-                "question": "Question", "course_id": "c1", "user_id": "u1",
-            }, raise_on_error=False), timeout=1)
+            result = await asyncio.wait_for(client.call_tool("generate_session_reply", {"conversation_id": "conv-1"}, raise_on_error=False), timeout=1)
             self.assertTrue(result.is_error)
             self.assertIn("deadline", result.content[0].text)
             self.assertTrue(cancelled.is_set())
@@ -255,14 +221,12 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_response_is_a_safe_tool_error(self):
         api = FastAPI()
 
-        @api.post("/reply")
+        @api.post("/reply-sessions/{conversation_id}/generate")
         async def answer():
             return {"private_body": "must-not-be-exposed"}
 
         async with Client(create_mcp_server(api)) as client:
-            result = await client.call_tool("answer_student_question", {
-                "question": "Question", "course_id": "c1", "user_id": "u1",
-            }, raise_on_error=False)
+            result = await client.call_tool("generate_session_reply", {"conversation_id": "conv-1"}, raise_on_error=False)
         self.assertTrue(result.is_error)
         self.assertIn("invalid response", result.content[0].text)
         self.assertNotIn("must-not-be-exposed", result.content[0].text)
@@ -272,7 +236,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         entered = asyncio.Event()
         cancelled = asyncio.Event()
 
-        @api.post("/reply")
+        @api.post("/reply-sessions/{conversation_id}/generate")
         async def answer():
             entered.set()
             try:
@@ -282,9 +246,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
 
         server = create_mcp_server(api)
         with self.assertLogs("mcp_server") as captured:
-            task = asyncio.create_task(server.call_tool("answer_student_question", {
-                "question": "Question", "course_id": "c1", "user_id": "u1",
-            }))
+            task = asyncio.create_task(server.call_tool("generate_session_reply", {"conversation_id": "conv-1"}))
             try:
                 await asyncio.wait_for(entered.wait(), timeout=1)
             finally:
@@ -298,14 +260,12 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_error_body_is_not_exposed_to_client(self):
         api = FastAPI()
 
-        @api.post("/reply")
+        @api.post("/reply-sessions/{conversation_id}/generate")
         async def answer():
             raise HTTPException(503, detail={"secret": "must-not-be-exposed"})
 
         async with Client(create_mcp_server(api)) as client:
-            result = await client.call_tool("answer_student_question", {
-                "question": "Question", "course_id": "c1", "user_id": "u1",
-            }, raise_on_error=False)
+            result = await client.call_tool("generate_session_reply", {"conversation_id": "conv-1"}, raise_on_error=False)
         self.assertTrue(result.is_error)
         self.assertIn("HTTP 503", result.content[0].text)
         self.assertIn("Request ID:", result.content[0].text)

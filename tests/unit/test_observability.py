@@ -12,7 +12,7 @@ from fastmcp import Client
 from main import app
 from mcp_server import create_mcp_server
 from src.logger import EventFormatter, get_log_context, get_logger, log_context, log_operation
-from src.models import ReplyResponse
+from src.reply_sessions import ReplySessionStore
 
 
 class LoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -46,19 +46,19 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mcp_and_api_logs_share_request_id_without_payloads(self):
         private = "private-student-question-do-not-log"
-        answer = ReplyResponse(reply="private-generated-answer", status="answered", citations=[])
-        with patch("main.run_orchestration", new=AsyncMock(return_value=answer)), self.assertLogs("mcp_server") as mcp_logs, self.assertLogs("src.observability") as api_logs:
+        with patch("main.reply_sessions", ReplySessionStore()), patch(
+            "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv-logs"),
+        ), self.assertLogs("mcp_server") as mcp_logs, self.assertLogs("src.observability") as api_logs:
             async with Client(create_mcp_server(app)) as client:
-                await client.call_tool("answer_student_question", {
+                await client.call_tool("create_reply_session", {
                     "question": private, "course_id": "course-1", "user_id": "private-user-id",
                 })
         mcp_id = mcp_logs.records[0].event_fields["request_id"]
         self.assertEqual({r.event_fields["request_id"] for r in api_logs.records}, {mcp_id})
-        self.assertEqual(api_logs.records[-1].event_fields["route"], "/reply")
+        self.assertEqual(api_logs.records[-1].event_fields["route"], "/reply-sessions")
         self.assertEqual(api_logs.records[-1].event_fields["transport"], "mcp")
         logs = "\n".join(EventFormatter().format(r) for r in [*mcp_logs.records, *api_logs.records])
         self.assertNotIn(private, logs)
-        self.assertNotIn("private-generated-answer", logs)
         self.assertNotIn("private-user-id", logs)
 
     async def test_mcp_rejection_keeps_status_and_outcome_without_duplicate_logs(self):
@@ -94,9 +94,9 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
             self.assertNoLogs("fastmcp.server.server", level="DEBUG"),
         ):
             async with Client(server) as client:
-                result = await client.call_tool("answer_student_question", {
-                    "question": "private-question", "course_id": "c1", "user_id": "u1",
-                    "chat_history": [{"private-field": "private-content"}],
+                result = await client.call_tool("create_reply_session", {
+                    "question": {"private-field": "private-content"},
+                    "course_id": "c1", "user_id": "private-user-id",
                 }, raise_on_error=False)
         self.assertTrue(result.is_error)
         self.assertEqual(
@@ -106,7 +106,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured.records[-1].event_fields["outcome"], "rejected")
         logs = "\n".join(EventFormatter().format(r) for r in captured.records)
         self.assertNotIn("private-content", logs)
-        self.assertNotIn("private-question", logs)
+        self.assertNotIn("private-user-id", logs)
         self.assertNotIn("private-field", logs)
 
 
@@ -140,7 +140,7 @@ class LogFormattingTests(unittest.TestCase):
 class HttpLoggingTests(unittest.TestCase):
     def test_request_id_is_returned_and_validation_failure_is_observable(self):
         with self.assertLogs("src.observability") as captured:
-            response = TestClient(app).post("/reply?secret=private-query", json={"question": "private-question"}, headers={"X-Request-ID": "request-test-123"})
+            response = TestClient(app).post("/reply-sessions?secret=private-query", json={"question": "private-question"}, headers={"X-Request-ID": "request-test-123"})
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.headers["x-request-id"], "request-test-123")
         fields = captured.records[-1].event_fields

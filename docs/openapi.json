@@ -1,14 +1,25 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "FastAPI",
+    "title": "OnCourse Agent API",
+    "description": "Student reply sessions with lecturer review and revision workflows.",
     "version": "0.1.0"
   },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "Local development"
+    }
+  ],
   "paths": {
     "/health": {
       "get": {
-        "summary": "Check Health",
-        "operationId": "check_health_health_get",
+        "tags": [
+          "Health"
+        ],
+        "summary": "Check service health",
+        "description": "Check that the application responds. This does not check upstream dependencies.",
+        "operationId": "check_health",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -16,55 +27,7 @@
               "application/json": {
                 "schema": {
                   "type": "string",
-                  "title": "Response Check Health Health Get"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/reply": {
-      "post": {
-        "summary": "Generate Reply",
-        "operationId": "generate_reply_reply_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReplyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReplyResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Service Unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReplyResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "title": "Response Check Health"
                 }
               }
             }
@@ -74,8 +37,12 @@
     },
     "/reply-sessions": {
       "post": {
-        "summary": "Create Reply Session",
-        "operationId": "create_reply_session_reply_sessions_post",
+        "tags": [
+          "Reply Sessions"
+        ],
+        "summary": "Create a reply session",
+        "description": "Create a session in pending_generation state and return its conversation_id.",
+        "operationId": "create_reply_session",
         "requestBody": {
           "content": {
             "application/json": {
@@ -97,6 +64,16 @@
               }
             }
           },
+          "503": {
+            "description": "The session could not be created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -112,8 +89,12 @@
     },
     "/reply-sessions/{conversation_id}": {
       "get": {
-        "summary": "Get Reply Session",
-        "operationId": "get_reply_session_reply_sessions__conversation_id__get",
+        "tags": [
+          "Reply Sessions"
+        ],
+        "summary": "Get a reply session",
+        "description": "Return the current session state, student question, feedback, and generated revisions.",
+        "operationId": "get_reply_session",
         "parameters": [
           {
             "name": "conversation_id",
@@ -132,6 +113,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReplySession"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Reply session not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
                 }
               }
             }
@@ -151,8 +142,12 @@
     },
     "/reply-sessions/{conversation_id}/generate": {
       "post": {
-        "summary": "Generate Session Reply",
-        "operationId": "generate_session_reply_reply_sessions__conversation_id__generate_post",
+        "tags": [
+          "Reply Sessions"
+        ],
+        "summary": "Generate or revise a session reply",
+        "description": "Generate the first draft for a pending_generation session, or revise a draft for a revision_requested session using teacher feedback and existing evidence. The updated session enters awaiting_review. No request body is required.",
+        "operationId": "generate_session_reply",
         "parameters": [
           {
             "name": "conversation_id",
@@ -175,6 +170,36 @@
               }
             }
           },
+          "404": {
+            "description": "Reply session not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not ready for generation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The reply could not be generated or checked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -190,8 +215,12 @@
     },
     "/reply-sessions/{conversation_id}/review": {
       "post": {
-        "summary": "Review Reply Session",
-        "operationId": "review_reply_session_reply_sessions__conversation_id__review_post",
+        "tags": [
+          "Reply Sessions"
+        ],
+        "summary": "Request a reply revision",
+        "description": "Record teacher feedback for an awaiting_review session and move it to revision_requested. Call the generate operation to produce the revised draft.",
+        "operationId": "review_reply_session",
         "parameters": [
           {
             "name": "conversation_id",
@@ -224,6 +253,26 @@
               }
             }
           },
+          "404": {
+            "description": "Reply session not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not awaiting review.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -239,8 +288,12 @@
     },
     "/reply-sessions/{conversation_id}/accept": {
       "post": {
-        "summary": "Accept Reply Session",
-        "operationId": "accept_reply_session_reply_sessions__conversation_id__accept_post",
+        "tags": [
+          "Reply Sessions"
+        ],
+        "summary": "Accept a session reply",
+        "description": "Persist the final draft from an awaiting_review session as historical Q&A, then mark the session accepted. No request body is required.",
+        "operationId": "accept_reply_session",
         "parameters": [
           {
             "name": "conversation_id",
@@ -263,6 +316,36 @@
               }
             }
           },
+          "404": {
+            "description": "Reply session not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not awaiting review.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The accepted reply could not be persisted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -279,42 +362,6 @@
   },
   "components": {
     "schemas": {
-      "ChatMessage": {
-        "properties": {
-          "role": {
-            "type": "string",
-            "enum": [
-              "user",
-              "assistant"
-            ],
-            "title": "Role"
-          },
-          "content": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Content"
-          },
-          "created_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created At"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "role",
-          "content"
-        ],
-        "title": "ChatMessage"
-      },
       "CreateReplySessionRequest": {
         "properties": {
           "question": {
@@ -347,6 +394,21 @@
         ],
         "title": "CreateReplySessionRequest"
       },
+      "HTTPErrorResponse": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "HTTPErrorResponse",
+        "description": "Error body returned by HTTPException for reply-session operations."
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -359,72 +421,6 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
-      },
-      "ReplyRequest": {
-        "properties": {
-          "question": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Question"
-          },
-          "user_id": {
-            "type": "string",
-            "title": "User Id"
-          },
-          "course_id": {
-            "type": "string",
-            "title": "Course Id"
-          },
-          "chat_history": {
-            "items": {
-              "$ref": "#/components/schemas/ChatMessage"
-            },
-            "type": "array",
-            "title": "Chat History"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "question",
-          "user_id",
-          "course_id"
-        ],
-        "title": "ReplyRequest"
-      },
-      "ReplyResponse": {
-        "properties": {
-          "reply": {
-            "type": "string",
-            "title": "Reply"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "answered",
-              "needs_clarification",
-              "not_found",
-              "escalated",
-              "error"
-            ],
-            "title": "Status"
-          },
-          "citations": {
-            "items": {
-              "$ref": "#/components/schemas/SearchResult"
-            },
-            "type": "array",
-            "title": "Citations"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "reply",
-          "status",
-          "citations"
-        ],
-        "title": "ReplyResponse"
       },
       "ReplySession": {
         "properties": {
@@ -526,68 +522,6 @@
         ],
         "title": "Revision"
       },
-      "SearchResult": {
-        "properties": {
-          "source": {
-            "$ref": "#/components/schemas/SearchSource"
-          },
-          "content": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Content"
-          },
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
-          "source_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Url"
-          },
-          "excerpt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Excerpt"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "source",
-          "content"
-        ],
-        "title": "SearchResult"
-      },
-      "SearchSource": {
-        "type": "string",
-        "enum": [
-          "course_materials",
-          "university_policies",
-          "historical_qna",
-          "canvas"
-        ],
-        "title": "SearchSource"
-      },
       "SessionStatus": {
         "type": "string",
         "enum": [
@@ -639,5 +573,15 @@
         "title": "ValidationError"
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Service availability."
+    },
+    {
+      "name": "Reply Sessions",
+      "description": "Create, generate, review, and accept lecturer reply drafts."
+    }
+  ]
 }

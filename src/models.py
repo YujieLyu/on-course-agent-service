@@ -70,12 +70,16 @@ class ChatMessage(StrictModel):
 
 
 class ReplyRequest(StrictModel):
+    """Internal input for initial reply orchestration; not an HTTP request model."""
+
     question: str = Field(min_length=1)
     user_id: str
     course_id: str
     chat_history: list[ChatMessage] = Field(default_factory=list)
 
 class ReplyResponse(StrictModel):
+    """Internal generated answer used by orchestration and evidence checks."""
+
     reply: str
     status: Literal[
         "answered",
@@ -85,6 +89,12 @@ class ReplyResponse(StrictModel):
         "error",
     ]
     citations: list[SearchResult]
+
+
+class HTTPErrorResponse(StrictModel):
+    """Error body returned by HTTPException for reply-session operations."""
+
+    detail: str
 
 
 class SessionStatus(StrEnum):
