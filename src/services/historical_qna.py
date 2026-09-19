@@ -1,33 +1,26 @@
-from datetime import UTC, datetime
+"""Prepare accepted QA content without depending on a database SDK."""
 
-from src.config import load_cosmos_qna_settings
-from src.models import ReplySession
-from src.repositories import historical_qna as historical_qna_repository
-from src.services.embeddings import generate_embedding
+import asyncio
+from collections.abc import Awaitable, Callable
+
+from src.domain.reply_sessions import AcceptedQna, AcceptedReply, QaMemoryRepository
 
 
-async def save_accepted_qna(session: ReplySession) -> None:
-    """Persist the final reviewed answer using a deterministic, idempotent ID."""
-    if not session.revisions or not session.revisions[-1].revision_content:
-        raise ValueError("The session has no generated response to persist")
+class HistoricalQnaPublisher:
+    def __init__(
+        self, repository: QaMemoryRepository,
+        embed: Callable[[str], Awaitable[list[float]]],
+        embedding_dimensions: int,
+    ) -> None:
+        self.repository = repository
+        self.embed = embed
+        self.embedding_dimensions = embedding_dimensions
 
-    settings = load_cosmos_qna_settings()
-    question_vector = await generate_embedding(session.student_query)
-    expected_dimensions = settings["embedding_dimensions"]
-    if len(question_vector) != expected_dimensions:
-        raise ValueError(
-            "Embedding dimensions do not match the Cosmos vector policy: "
-            f"expected {expected_dimensions}, got {len(question_vector)}"
-        )
-
-    item = {
-        "id": session.conversation_id,
-        "document_type": "historical_qna",
-        "course_id": session.course_id,
-        "student_query": session.student_query,
-        "accepted_response": session.revisions[-1].revision_content,
-        "revision_number": session.revisions[-1].revision_number,
-        "accepted_at": datetime.now(UTC).isoformat(),
-        "question_vector": question_vector,
-    }
-    await historical_qna_repository.upsert_accepted_qna(item)
+    async def publish(self, reply: AcceptedReply) -> None:
+        vector = await self.embed(reply.student_query)
+        if len(vector) != self.embedding_dimensions:
+            raise ValueError(
+                "Embedding dimensions do not match the configured policy: "
+                f"expected {self.embedding_dimensions}, got {len(vector)}"
+            )
+        await asyncio.to_thread(self.repository.save, AcceptedQna(reply, tuple(vector)))

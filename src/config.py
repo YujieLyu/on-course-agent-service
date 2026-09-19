@@ -5,6 +5,7 @@ from string import Template
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from src.logger import get_logger
+from src.domain.retention import SESSION_RETENTION
 
 logger = get_logger(__name__)
 
@@ -75,3 +76,18 @@ def get_log_format() -> str:
         "LOG_FORMAT",
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+
+REPLY_SESSION_RETENTION_SECONDS = int(SESSION_RETENTION.total_seconds())
+
+
+def load_cosmos_session_settings() -> dict:
+    container_name = os.environ.get("AZURE_COSMOS_REPLY_SESSIONS_CONTAINER", "reply_sessions")
+    if container_name == os.environ.get("AZURE_COSMOS_QA_MEMORY_CONTAINER", "qa_memory"):
+        raise ValueError("Reply sessions and historical Q&A must use separate containers")
+    return {
+        "endpoint": os.environ["AZURE_COSMOS_ENDPOINT"],
+        "key": os.environ["AZURE_COSMOS_KEY"],
+        "database_name": os.environ["AZURE_COSMOS_DATABASE_NAME"],
+        "container_name": container_name,
+    }

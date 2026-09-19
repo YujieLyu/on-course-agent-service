@@ -12,7 +12,7 @@ from fastmcp import Client
 from main import app
 from mcp_server import create_mcp_server
 from src.logger import EventFormatter, get_log_context, get_logger, log_context, log_operation
-from src.reply_sessions import ReplySessionStore
+from tests.fakes import make_session_store
 
 
 class LoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -46,8 +46,8 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mcp_and_api_logs_share_request_id_without_payloads(self):
         private = "private-student-question-do-not-log"
-        with patch("main.reply_sessions", ReplySessionStore()), patch(
-            "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv-logs"),
+        with patch("main.reply_sessions", make_session_store()), patch(
+            "main.create_conversation", new=AsyncMock(return_value="conv-logs"),
         ), self.assertLogs("mcp_server") as mcp_logs, self.assertLogs("src.observability") as api_logs:
             async with Client(create_mcp_server(app)) as client:
                 await client.call_tool("create_reply_session", {
@@ -63,6 +63,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mcp_rejection_keeps_status_and_outcome_without_duplicate_logs(self):
         with (
+            patch("main.reply_sessions", make_session_store()),
             self.assertLogs("mcp_server") as mcp_logs,
             self.assertLogs("src.observability") as api_logs,
             self.assertNoLogs("fastmcp.server.server", level="DEBUG"),

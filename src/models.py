@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.domain.retention import SESSION_RETENTION, utc_now
+
 
 class StrictModel(BaseModel):
     """Base model used for LLM structured outputs."""
@@ -97,10 +99,19 @@ class HTTPErrorResponse(StrictModel):
     detail: str
 
 
+class ReplyGeneration(StrictModel):
+    """An answer and the evidence to persist atomically with its first revision."""
+
+    response: ReplyResponse
+    intent: IntentClassification
+    retrieved_context: list[SearchResult]
+
+
 class SessionStatus(StrEnum):
     PENDING_GENERATION = "pending_generation"
     AWAITING_REVIEW = "awaiting_review"
     REVISION_REQUESTED = "revision_requested"
+    ACCEPTING = "accepting"
     ACCEPTED = "accepted"
 
 
@@ -117,6 +128,8 @@ class ReplySession(StrictModel):
     student_query: str = Field(min_length=1)
     status: SessionStatus = SessionStatus.PENDING_GENERATION
     revisions: list[Revision] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    expires_at: datetime = Field(default_factory=lambda: utc_now() + SESSION_RETENTION)
 
 
 class CreateReplySessionRequest(StrictModel):

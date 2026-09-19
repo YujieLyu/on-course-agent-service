@@ -1,4 +1,4 @@
-
+import asyncio
 from fastapi import FastAPI, HTTPException
 
 from src.agents.orchestrator import generate_session_revision, run_orchestration
@@ -12,10 +12,12 @@ from src.models import (
     ReviewReplySessionRequest,
     SessionStatus,
 )
-from src.services.historical_qna import save_accepted_qna
-from src.reply_sessions import (
+from src.bootstrap import create_session_store, save_accepted_qna
+from src.services.reply_acceptance import accept_reply
+from src.workflow.llm import create_conversation
+from src.domain.reply_sessions import (
     InvalidSessionActionError,
-    ReplySessionStore,
+    QaMemoryConflictError,
     SessionNotFoundError,
 )
 
@@ -39,7 +41,7 @@ app = FastAPI(
 )
 app.add_middleware(RequestLoggingMiddleware)
 logger = get_logger(__name__)
-reply_sessions = ReplySessionStore()
+reply_sessions = create_session_store()
 
 @app.get(
     "/health",
@@ -56,7 +58,7 @@ def check_health() -> str:
     "/reply-sessions",
     tags=["Reply Sessions"],
     summary="Create a reply session",
-    description="Create a session in pending_generation state and return its conversation_id.",
+    description="Persist a pending_generation session with a fixed 30-day lifetime and return its conversation_id.",
     operation_id="create_reply_session",
     response_model=ReplySession,
     status_code=201,
@@ -64,8 +66,9 @@ def check_health() -> str:
 )
 async def create_reply_session(request: CreateReplySessionRequest) -> ReplySession:
     try:
-        return await reply_sessions.create(
-            request.question,
+        conversation_id = await create_conversation()
+        return await asyncio.to_thread(
+            reply_sessions.create, conversation_id, request.question,
             request.course_id,
             request.user_id,
         )
@@ -84,13 +87,19 @@ async def create_reply_session(request: CreateReplySessionRequest) -> ReplySessi
     description="Return the current session state, student question, feedback, and generated revisions.",
     operation_id="get_reply_session",
     response_model=ReplySession,
-    responses={404: {"model": HTTPErrorResponse, "description": "Reply session not found."}},
+    responses={
+        404: {"model": HTTPErrorResponse, "description": "Reply session not found or expired."},
+        503: {"model": HTTPErrorResponse, "description": "The session could not be retrieved."},
+    },
 )
 def get_reply_session(conversation_id: str) -> ReplySession:
     try:
         return reply_sessions.get(conversation_id)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
+    except Exception:
+        logger.exception("Failed to retrieve reply session")
+        raise HTTPException(status_code=503, detail="The service could not retrieve the session")
 
 
 @app.post(
@@ -112,11 +121,13 @@ def get_reply_session(conversation_id: str) -> ReplySession:
 )
 async def generate_session_reply(conversation_id: str) -> ReplySession:
     try:
-        session = reply_sessions.get(conversation_id)
+        snapshot = await asyncio.to_thread(reply_sessions.load_snapshot, conversation_id)
+        session = snapshot.session
         if session.status == SessionStatus.REVISION_REQUESTED:
-            return await generate_session_revision(conversation_id, reply_sessions)
+            response = await generate_session_revision(snapshot)
+            return await asyncio.to_thread(reply_sessions.save_generation, snapshot, response.reply)
         if session.status == SessionStatus.PENDING_GENERATION:
-            response = await run_orchestration(
+            generation = await run_orchestration(
                 ReplyRequest(
                     question=session.student_query,
                     user_id=session.user_id or conversation_id,
@@ -124,9 +135,11 @@ async def generate_session_reply(conversation_id: str) -> ReplySession:
                 ),
                 session_context=session.model_dump_json(),
                 conversation_id=conversation_id,
-                session_store=reply_sessions,
             )
-            return reply_sessions.save_generation(conversation_id, response.reply)
+            return await asyncio.to_thread(
+                reply_sessions.save_generation, snapshot, generation.response.reply,
+                evidence=(generation.intent, generation.retrieved_context),
+            )
         raise InvalidSessionActionError("Session is not ready for generation")
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
@@ -153,6 +166,7 @@ async def generate_session_reply(conversation_id: str) -> ReplySession:
     responses={
         404: {"model": HTTPErrorResponse, "description": "Reply session not found."},
         409: {"model": HTTPErrorResponse, "description": "The session is not awaiting review."},
+        503: {"model": HTTPErrorResponse, "description": "The feedback could not be saved."},
     },
 )
 def review_reply_session(
@@ -164,6 +178,9 @@ def review_reply_session(
         raise HTTPException(status_code=404, detail="Reply session not found")
     except InvalidSessionActionError as error:
         raise HTTPException(status_code=409, detail=str(error))
+    except Exception:
+        logger.exception("Failed to save reply session feedback")
+        raise HTTPException(status_code=503, detail="The service could not save the feedback")
 
 
 @app.post(
@@ -171,27 +188,24 @@ def review_reply_session(
     tags=["Reply Sessions"],
     summary="Accept a session reply",
     description=(
-        "Persist the final draft from an awaiting_review session as historical Q&A, "
-        "then mark the session accepted. No request body is required."
+        "Conditionally lock the reviewed revision in accepting state, publish it to QA Memory, "
+        "then mark it accepted. Retry accepting sessions to resume publication; accepted sessions "
+        "return successfully without another write. No request body is required."
     ),
     operation_id="accept_reply_session",
     response_model=ReplySession,
     responses={
         404: {"model": HTTPErrorResponse, "description": "Reply session not found."},
-        409: {"model": HTTPErrorResponse, "description": "The session is not awaiting review."},
+        409: {"model": HTTPErrorResponse, "description": "Session state, revision, or QA Memory version conflicts with acceptance."},
         503: {"model": HTTPErrorResponse, "description": "The accepted reply could not be persisted."},
     },
 )
 async def accept_reply_session(conversation_id: str) -> ReplySession:
     try:
-        session = reply_sessions.get(conversation_id)
-        if session.status != SessionStatus.AWAITING_REVIEW:
-            raise InvalidSessionActionError("Session is not awaiting review")
-        await save_accepted_qna(session)
-        return reply_sessions.accept(conversation_id)
+        return await accept_reply(conversation_id, reply_sessions, save_accepted_qna)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
-    except InvalidSessionActionError as error:
+    except (InvalidSessionActionError, QaMemoryConflictError) as error:
         raise HTTPException(status_code=409, detail=str(error))
     except Exception:
         logger.exception(

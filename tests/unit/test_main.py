@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from main import app
 from src.models import ReplyResponse
-from src.reply_sessions import ReplySessionStore
+from tests.fakes import generation_result, make_session_store
 
 
 class RemovedReplyEndpointTests(unittest.TestCase):
@@ -24,12 +24,12 @@ class ReplySessionEndpointTests(unittest.TestCase):
     def test_every_generated_reply_can_be_revised_multiple_times(self):
         for reply_status in ["answered", "needs_clarification", "not_found", "escalated", "error"]:
             with self.subTest(reply_status=reply_status), patch(
-                "main.reply_sessions", ReplySessionStore(),
+                "main.reply_sessions", make_session_store(),
             ), patch(
-                "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv_1"),
+                "main.create_conversation", new=AsyncMock(return_value="conv_1"),
             ), patch(
                 "main.run_orchestration",
-                new=AsyncMock(return_value=ReplyResponse(reply="Initial draft", status=reply_status, citations=[])),
+                new=AsyncMock(return_value=generation_result(ReplyResponse(reply="Initial draft", status=reply_status, citations=[]))),
             ) as initial, patch(
                 "src.agents.orchestrator.run_answer",
                 new=AsyncMock(side_effect=[
@@ -63,17 +63,18 @@ class ReplySessionEndpointTests(unittest.TestCase):
     def test_failed_generation_preserves_state_and_can_be_retried(self):
         for is_revision in [False, True]:
             generation_target = "src.agents.orchestrator.run_answer" if is_revision else "main.run_orchestration"
-            store = ReplySessionStore()
+            store = make_session_store()
             with self.subTest(is_revision=is_revision), patch("main.reply_sessions", store), patch(
-                "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv_1"),
+                "main.create_conversation", new=AsyncMock(return_value="conv_1"),
             ), patch(generation_target, new=AsyncMock(side_effect=[
                 RuntimeError("dependency unavailable"),
-                ReplyResponse(reply="Generated draft", status="answered", citations=[]),
+                (ReplyResponse(reply="Generated draft", status="answered", citations=[]) if is_revision else
+                 generation_result(ReplyResponse(reply="Generated draft", status="answered", citations=[]))),
             ])), patch("main.logger.exception"):
                 client = TestClient(app)
                 client.post("/reply-sessions", json={"question": "Question", "course_id": "c1"})
                 if is_revision:
-                    store.save_generation("conv_1", "Initial draft")
+                    store.save_generation(store.load_snapshot("conv_1"), "Initial draft")
                     client.post("/reply-sessions/conv_1/review", json={"feedback": "Shorter"})
                 before = client.get("/reply-sessions/conv_1").json()
                 failed = client.post("/reply-sessions/conv_1/generate")
@@ -87,17 +88,17 @@ class ReplySessionEndpointTests(unittest.TestCase):
 
     def test_complete_review_flow_uses_openai_conversation(self):
         initial_orchestration = AsyncMock(
-            return_value=ReplyResponse(
+            return_value=generation_result(ReplyResponse(
                 reply="Initial draft", status="answered", citations=[]
-            )
+            ))
         )
         revision_generation = AsyncMock(
             return_value=ReplyResponse(
                 reply="Revised draft", status="answered", citations=[]
             )
         )
-        with patch("main.reply_sessions", ReplySessionStore()), patch(
-            "src.reply_sessions.create_conversation",
+        with patch("main.reply_sessions", make_session_store()), patch(
+            "main.create_conversation",
             new=AsyncMock(return_value="conv_1"),
         ), patch("main.run_orchestration", new=initial_orchestration), patch(
             "src.agents.orchestrator.run_answer",
@@ -136,20 +137,12 @@ class ReplySessionEndpointTests(unittest.TestCase):
         self.assertTrue(revision_call.kwargs["is_revision"])
         self.assertIn("Make it friendlier.", revision_call.kwargs["session_context"])
 
-    def test_failed_cosmos_write_does_not_mark_session_accepted(self):
-        store = ReplySessionStore()
+    def test_failed_qa_publication_leaves_a_recoverable_acceptance(self):
+        store = make_session_store()
 
-        async def arrange_session():
-            with patch(
-                "src.reply_sessions.create_conversation",
-                new=AsyncMock(return_value="conv_1"),
-            ):
-                await store.create("What is due?", "course-1")
-            store.save_generation("conv_1", "Friday.")
+        store.create("conv_1", "What is due?", "course-1")
+        store.save_generation(store.load_snapshot("conv_1"), "Friday.")
 
-        import asyncio
-
-        asyncio.run(arrange_session())
         with patch("main.reply_sessions", store), patch(
             "main.save_accepted_qna",
             new=AsyncMock(side_effect=RuntimeError("Cosmos unavailable")),
@@ -159,7 +152,7 @@ class ReplySessionEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(
             store.get("conv_1").status.value,
-            "awaiting_review",
+            "accepting",
         )
 
 

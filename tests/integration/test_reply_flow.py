@@ -16,7 +16,7 @@ from src.models import (
     SearchSource,
     StudentIntent,
 )
-from src.reply_sessions import ReplySessionStore
+from tests.fakes import make_session_store
 from src.tools.search_providers import azure_ai_search, public_website_search
 
 
@@ -96,7 +96,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
     def setUp(self):
         azure_ai_search._get_settings.cache_clear()
         public_website_search._get_settings.cache_clear()
-        self.store = ReplySessionStore()
+        self.store = make_session_store()
         store_patch = patch("main.reply_sessions", self.store)
         store_patch.start()
         self.addCleanup(store_patch.stop)
@@ -238,7 +238,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         source_text = "AI Use Policy Students must disclose generative AI use in assessments."
         self.assert_generated(response, answer.reply)
-        _, evidence = self.store.get_evidence_context("conv-reply-flow")
+        evidence = list(self.store.load_snapshot("conv-reply-flow").retrieved_context)
         self.assertEqual(evidence, [citation.model_copy(update={
             "content": source_text, "excerpt": source_text,
         })])
@@ -417,7 +417,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 422)
-        self.assertEqual(self.store._sessions, {})
+        self.assertEqual(self.store.repository.snapshots, {})
         openai_constructor.assert_not_called()
         search_constructor.assert_not_called()
 

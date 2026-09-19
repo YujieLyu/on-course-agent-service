@@ -8,7 +8,7 @@ from fastmcp import Client
 
 from mcp_server import create_mcp_server
 from src.models import ReplySession
-from src.reply_sessions import ReplySessionStore
+from tests.fakes import make_session_store
 
 
 class McpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -184,10 +184,9 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_injection_cannot_accept_a_real_session(self):
         from main import app
 
-        store = ReplySessionStore()
-        with patch("src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv-1")):
-            await store.create("Question", "course-1")
-        store.save_generation("conv-1", "Draft")
+        store = make_session_store()
+        store.create("conv-1", "Question", "course-1")
+        store.save_generation(store.load_snapshot("conv-1"), "Draft")
         with patch("main.reply_sessions", store), patch("main.save_accepted_qna", new=AsyncMock()) as persist:
             async with Client(create_mcp_server(app)) as client:
                 result = await client.call_tool("generate_session_reply", {"conversation_id": "conv-1/accept?"}, raise_on_error=False)

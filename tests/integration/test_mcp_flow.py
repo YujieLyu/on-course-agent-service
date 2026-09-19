@@ -16,7 +16,7 @@ from mcp.client.stdio import stdio_client
 from main import app
 from mcp_server import create_mcp_server
 from src.models import IntentClassification, ReplyResponse, StudentIntent
-from src.reply_sessions import ReplySessionStore
+from tests.fakes import generation_result, make_session_store
 from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client, supported_review
 
 
@@ -33,9 +33,11 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         llm.conversations = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(id="conv-workflow")))
         container = Mock()
+        from azure.cosmos.exceptions import CosmosResourceNotFoundError
+        container.read_item.side_effect = CosmosResourceNotFoundError(status_code=404)
         settings = {"embedding_dimensions": 3}
 
-        with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", ReplySessionStore()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.services.historical_qna.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
+        with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", make_session_store()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.bootstrap.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
             async with Client(create_mcp_server(app)) as client:
                 created = await client.call_tool("create_reply_session", {"question": "Question", "course_id": "course-1"})
                 conversation_id = created.structured_content["conversation_id"]
@@ -52,8 +54,8 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(conflict.is_error)
                 self.assertIn("HTTP 409", conflict.content[0].text)
 
-        container.upsert_item.assert_called_once()
-        item = container.upsert_item.call_args.args[0]
+        container.create_item.assert_called_once()
+        item = container.create_item.call_args.kwargs["body"]
         self.assertEqual(item["accepted_response"], "Revised answer")
         self.assertEqual(item["id"], conversation_id)
         self.assertEqual(llm.responses.parse.await_count, 5)
@@ -63,9 +65,9 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         http_app = server.http_app(path="/mcp", stateless_http=True, json_response=True)
         answer = ReplyResponse(reply="HTTP answer", status="answered", citations=[])
         headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25"}
-        with patch("main.reply_sessions", ReplySessionStore()), patch(
-            "src.reply_sessions.create_conversation", new=AsyncMock(return_value="conv-http"),
-        ), patch("main.run_orchestration", new=AsyncMock(return_value=answer)):
+        with patch("main.reply_sessions", make_session_store()), patch(
+            "main.create_conversation", new=AsyncMock(return_value="conv-http"),
+        ), patch("main.run_orchestration", new=AsyncMock(return_value=generation_result(answer))):
             async with http_app.router.lifespan_context(http_app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=http_app), base_url="http://mcp.test", headers=headers) as client:
                     initialized = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -90,7 +92,7 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         root = Path(__file__).resolve().parents[2]
         params = StdioServerParameters(
             command=sys.executable, args=[str(root / "mcp_server.py")], cwd=str(root),
-            env={"LOG_FORMAT": "json", "LOG_LEVEL": "INFO"},
+            env={"LOG_FORMAT": "json", "LOG_LEVEL": "INFO", "AZURE_COSMOS_REPLY_SESSIONS_CONTAINER": "qa_memory"},
         )
         with tempfile.TemporaryFile(mode="w+") as stderr:
             async with asyncio.timeout(15):
@@ -101,8 +103,8 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len(tools.tools), 5)
                         failed = await session.call_tool("get_reply_session", {"conversation_id": "missing"})
                         self.assertTrue(failed.isError)
-                        self.assertIn("HTTP 404", failed.content[0].text)
+                        self.assertIn("HTTP 503", failed.content[0].text)
             stderr.seek(0)
             events = [json.loads(line) for line in stderr if line.startswith("{")]
         self.assertTrue(any(event["event"] == "mcp.tool.started" for event in events))
-        self.assertTrue(any(event.get("status_code") == 404 for event in events))
+        self.assertTrue(any(event.get("status_code") == 503 for event in events))

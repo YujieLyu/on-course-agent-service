@@ -150,7 +150,9 @@ SERVER_INSTRUCTIONS = (
     "request a revision and generate again, or accept the final reply after "
     "explicit teacher approval. Acceptance persists historical course Q&A. "
     "Use known course/user IDs and preserve returned conversation IDs. "
-    "After a timeout, get the session status before retrying a write."
+    "After a timeout, get the session status before retrying a write. "
+    "If status is accepting, retry accept_reply_session to finish the saved decision; "
+    "accepted sessions can be accepted again safely."
 )
 
 
@@ -225,7 +227,7 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
         annotations={"readOnlyHint": False, "destructiveHint": False},
     )
     async def accept_reply_session(conversation_id: ConversationId) -> ReplySession:
-        """Accept a reply and persist it as historical course Q&A."""
+        """Accept a reply, resume pending acceptance, or return an already accepted reply."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/accept",
