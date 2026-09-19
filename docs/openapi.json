@@ -41,7 +41,7 @@
           "Reply Sessions"
         ],
         "summary": "Create a reply session",
-        "description": "Create a session in pending_generation state and return its conversation_id.",
+        "description": "Persist a pending_generation session with a fixed 30-day lifetime and return its conversation_id.",
         "operationId": "create_reply_session",
         "requestBody": {
           "content": {
@@ -118,7 +118,17 @@
             }
           },
           "404": {
-            "description": "Reply session not found.",
+            "description": "Reply session not found or expired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The session could not be retrieved.",
             "content": {
               "application/json": {
                 "schema": {
@@ -273,6 +283,16 @@
               }
             }
           },
+          "503": {
+            "description": "The feedback could not be saved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -292,7 +312,7 @@
           "Reply Sessions"
         ],
         "summary": "Accept a session reply",
-        "description": "Persist the final draft from an awaiting_review session as historical Q&A, then mark the session accepted. No request body is required.",
+        "description": "Conditionally lock the reviewed revision in accepting state, publish it to QA Memory, then mark it accepted. Retry accepting sessions to resume publication; accepted sessions return successfully without another write. No request body is required.",
         "operationId": "accept_reply_session",
         "parameters": [
           {
@@ -327,7 +347,7 @@
             }
           },
           "409": {
-            "description": "The session is not awaiting review.",
+            "description": "Session state, revision, or QA Memory version conflicts with acceptance.",
             "content": {
               "application/json": {
                 "schema": {
@@ -459,6 +479,16 @@
             },
             "type": "array",
             "title": "Revisions"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
           }
         },
         "additionalProperties": false,
@@ -528,6 +558,7 @@
           "pending_generation",
           "awaiting_review",
           "revision_requested",
+          "accepting",
           "accepted"
         ],
         "title": "SessionStatus"

@@ -3,7 +3,8 @@
 A FastAPI service that generates grounded answers to student questions. It uses
 an LLM to classify each question, retrieves relevant context from the configured
 sources, and generates a draft in a reply session. Every reply supports teacher
-feedback and repeated revision before acceptance for reuse as historical Q&A.
+feedback and repeated revision before acceptance for reuse as historical Q&A. Acceptance pins the reviewed
+revision before publishing it and can be resumed after a failure.
 
 ## Features
 
@@ -17,8 +18,9 @@ feedback and repeated revision before acceptance for reuse as historical Q&A.
 - OpenAPI documentation provided by FastAPI
 
 Canvas is represented as a search source, but its provider is currently a stub
-and returns no results. Reply sessions are stored in process memory, so they are
-lost when the service restarts and are not shared between workers.
+and returns no results. Reply sessions and their evidence are stored in the
+Cosmos DB `reply_sessions` container. They survive service restarts and are
+shared between workers, and expire 30 days after creation.
 
 ## Evidence guardrail
 
@@ -38,7 +40,7 @@ failure uses the existing HTTP 503 error path and never releases the unchecked
 draft. Semantic support is still judged by a model and can be misclassified;
 the guardrail does not replace correct course filtering or complete source data.
 
-Session revisions reuse a process-local snapshot of the original retrieval and
+Session revisions reuse a persisted snapshot of the original retrieval and
 may use explicit factual confirmations from teacher feedback. Previous assistant
 drafts and requests to change tone are not evidence. The public API returns the
 session and its draft texts; internal answer statuses and structured citations
@@ -56,10 +58,9 @@ text, source passages, or feedback.
 - For accepted historical Q&A: an Azure Cosmos DB for NoSQL account with vector
   search enabled
 
-Azure AI Search and Cosmos DB are only contacted when the intent classifier
-selects their corresponding source, or when an accepted reply is persisted.
-However, a complete local environment should configure both because source
-selection happens dynamically.
+Cosmos DB is required for every reply-session operation. Azure AI Search and
+the historical Q&A container are queried when selected by the intent classifier;
+accepted answers are also persisted to historical Q&A.
 
 ## Setup
 
@@ -100,6 +101,7 @@ AZURE_COSMOS_ENDPOINT=https://<account>.documents.azure.com:443/
 AZURE_COSMOS_KEY=<cosmos-key>
 AZURE_COSMOS_DATABASE_NAME=course-brain
 AZURE_COSMOS_QA_MEMORY_CONTAINER=qa_memory
+AZURE_COSMOS_REPLY_SESSIONS_CONTAINER=reply_sessions
 AZURE_COSMOS_QNA_TOP_K=3
 AZURE_COSMOS_EMBEDDING_DIMENSIONS=1536
 
@@ -133,6 +135,26 @@ uv run python -m scripts.provision_cosmos_qna
 
 See [docs/historical-qna-cosmos.md](docs/historical-qna-cosmos.md) for the Azure
 setup details, vector policy, and production considerations.
+
+## Provision reply-session storage
+
+Create or validate the `reply_sessions` container in the existing database:
+
+```bash
+uv run python -m scripts.provision_cosmos_sessions
+```
+
+The container uses `/id` as its partition key and a 2,592,000-second default TTL.
+Sessions expire 30 days after creation; revision and acceptance do not extend
+that deadline. The application persists draft history and evidence together.
+`qa_memory` keeps accepted historical Q&A under its separate retention policy.
+
+For pending QA publications after a failure or restart, retry `/accept` or run
+`uv run python -m scripts.recover_reply_acceptances --limit 100`. Schedule this
+command in your deployment if unattended recovery is required.
+
+See [reply-session persistence](docs/reply-session-persistence.md) for setup,
+expiry behavior, and browser recovery using a saved `conversation_id`.
 
 ## Run the service
 
@@ -190,8 +212,8 @@ codex mcp list
 
 The MCP process loads the same `.env` configuration as the FastAPI service.
 Generating replies therefore requires the same OpenAI and retrieval settings
-described in [Setup](#setup). Reply sessions remain in memory and last only for
-the lifetime of the MCP process.
+described in [Setup](#setup). Reply sessions are shared with HTTP workers using
+the same Cosmos database and session container and last 30 days from creation.
 
 Tool schemas describe the same sessions and revision feedback as the HTTP API.
 Create a session, generate its draft, then submit feedback and generate again
@@ -213,8 +235,8 @@ uv run fastmcp run mcp_server.py:mcp --transport http --host 127.0.0.1 --port 80
 ```
 
 Use the `/mcp` endpoint on that port. A shared deployment still needs
-authentication, course/session authorization, and durable session storage.
-Separate FastAPI and MCP processes do not share in-memory sessions. Acceptance
+authentication and course/session authorization. FastAPI and MCP processes share
+sessions through Cosmos DB. Acceptance
 should only be called after explicit teacher approval; the tool description is
 guidance to the calling agent, not an authorization check.
 
@@ -283,7 +305,9 @@ using the [contract maintenance instructions](docs/api-contract.md#maintaining-t
 All replies use this session workflow. The direct `POST /reply` endpoint and
 `answer_student_question` MCP tool have been removed; clients must create a
 session and generate its reply. Every generated draft can be revised until it
-is accepted.
+enters `accepting`. This state locks the reviewed revision until QA publication
+finishes and the session becomes `accepted`. Repeating `/accept` resumes pending
+publication or returns an already accepted session.
 
 Create a session:
 

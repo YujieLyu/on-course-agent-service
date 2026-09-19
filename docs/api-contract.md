@@ -2,7 +2,7 @@
 
 This contract describes the implemented HTTP API in `main.py`, the wire models
 in `src/models.py`, and the session behavior in `src/reply_sessions.py` as of
-2026-09-18. It describes current behavior, including integration limitations;
+2026-09-19. It describes current behavior, including integration limitations;
 it does not propose additional endpoints.
 
 ## Connection and conventions
@@ -55,9 +55,9 @@ it when building paths. Do not assume a UUID or a particular prefix.
 | --- | --- | --- | --- | --- |
 | GET | `/health` | None | `200`, JSON string | — |
 | POST | `/reply-sessions` | `CreateReplySessionRequest` | `201`, `ReplySession` | `422`, `503` |
-| GET | `/reply-sessions/{conversation_id}` | None | `200`, `ReplySession` | `404` |
+| GET | `/reply-sessions/{conversation_id}` | None | `200`, `ReplySession` | `404`, `503` |
 | POST | `/reply-sessions/{conversation_id}/generate` | None | `200`, `ReplySession` | `404`, `409`, `503` |
-| POST | `/reply-sessions/{conversation_id}/review` | `ReviewReplySessionRequest` | `200`, `ReplySession` | `404`, `409`, `422` |
+| POST | `/reply-sessions/{conversation_id}/review` | `ReviewReplySessionRequest` | `200`, `ReplySession` | `404`, `409`, `422`, `503` |
 | POST | `/reply-sessions/{conversation_id}/accept` | None | `200`, `ReplySession` | `404`, `409`, `503` |
 
 For endpoints with no body, omit the body. Infrastructure failures can also
@@ -74,6 +74,7 @@ export type SessionStatus =
   | "pending_generation"
   | "awaiting_review"
   | "revision_requested"
+  | "accepting"
   | "accepted";
 
 export interface CreateReplySessionRequest {
@@ -99,6 +100,8 @@ export interface ReplySession {
   student_query: string; // The question submitted during creation.
   status: SessionStatus;
   revisions: Revision[]; // Ordered oldest to newest.
+  created_at: string; // UTC ISO 8601 timestamp.
+  expires_at: string; // Fixed at 30 days after creation.
 }
 ```
 
@@ -117,7 +120,9 @@ stateDiagram-v2
     pending_generation --> awaiting_review: POST /generate
     awaiting_review --> revision_requested: POST /review
     revision_requested --> awaiting_review: POST /generate
-    awaiting_review --> accepted: POST /accept
+    awaiting_review --> accepting: POST /accept commits decision
+    accepting --> accepted: QA publication confirmed
+    accepting --> accepting: Retry pending publication
 ```
 
 | Current status | Allowed mutating actions | Suggested UI |
@@ -125,11 +130,14 @@ stateDiagram-v2
 | `pending_generation` | Generate | Generate draft |
 | `awaiting_review` | Review, accept | Show draft, request changes, accept |
 | `revision_requested` | Generate | Show feedback, generate revision |
-| `accepted` | None | Show accepted answer |
+| `accepting` | Retry accept | Show pending QA save; disable revision |
+| `accepted` | Accept is an idempotent no-op | Show accepted answer |
 
 `GET` is available in every state. There is no `generating` or `failed` session
 state; track in-flight requests locally and disable competing actions. State
-checks are not a concurrency-control mechanism: serialize mutations per session.
+writes use Cosmos ETags to reject conflicting updates with `409`. Continue to
+serialize mutations per session; generation and historical Q&A acceptance span
+multiple operations.
 
 ### 1. Create: `POST /reply-sessions`
 
@@ -152,12 +160,14 @@ Response (`201`):
   "user_id": "student-123",
   "student_query": "When is Assignment 1 due?",
   "status": "pending_generation",
-  "revisions": []
+  "revisions": [],
+  "created_at": "2026-09-19T00:00:00Z",
+  "expires_at": "2026-10-19T00:00:00Z"
 }
 ```
 
-Creation allocates a conversation but does not generate an answer. It can call
-an external conversation service and fail with `503`. Save the returned
+Creation allocates a conversation and persists the session but does not generate
+an answer. Conversation creation or Cosmos persistence can fail with `503`. Save the returned
 `conversation_id` to address subsequent requests. There is no supported update
 to the original question, course, or user after creation.
 
@@ -212,27 +222,42 @@ revision for acceptance.
 
 ### 4. Accept: `POST /reply-sessions/{conversation_id}/accept`
 
-No body. Requires `awaiting_review`. Persists the original question and latest
-answer as course-scoped historical Q&A, then returns the full session with
-`status: "accepted"`. Embedding generation and Cosmos DB persistence happen
-before the state changes. On persistence failure, the endpoint returns `503`
-and the session remains `awaiting_review` in the ordinary sequential flow.
+No body. From `awaiting_review`, the service conditionally pins the latest
+revision and an immutable acceptance payload, then enters `accepting` before
+embedding or publishing QA Memory. Review and generation are blocked in this
+state. After version-protected QA publication succeeds, the session becomes
+`accepted` and the endpoint returns `200`.
 
-Acceptance applies to the latest generated revision. Calling `/accept` again
-after success returns `409`; there is no reopen or undo endpoint. Acceptance
-does not send the answer to a student or publish a message elsewhere.
+On failure, the endpoint returns `503`; GET may show `awaiting_review` if no
+claim committed, `accepting` if synchronization is pending, or `accepted` if the
+final acknowledgement was lost. Retry `/accept` for `accepting`. Calling it again
+after success returns the accepted session with `200` and does not republish.
+A state/version conflict, including incompatible QA Memory content, returns
+`409` and does not overwrite a newer accepted revision.
+
+There is no reopen or undo endpoint. Acceptance does not send the answer to a
+student or publish a message elsewhere. See [persistence and recovery](reply-session-persistence.md)
+for the recovery job and the remaining cross-container consistency boundary.
 
 ### Retrieve: `GET /reply-sessions/{conversation_id}`
 
-Returns the current full session (`200`), or `404` if it is unknown to this
-process. It does not trigger generation. Use it to refresh UI state or reconcile
-an uncertain mutation outcome after a timeout.
+Returns the current full session (`200`), `404` if it is unknown or expired,
+or `503` when persistence is unavailable. It does not trigger generation. Use it
+to restore the page after a reload or reconcile an uncertain mutation outcome.
 
-Sessions are held in process memory, lost on restart, and not shared between
-workers or replicas. Persisting an accepted Q&A does not make the session
-retrievable after restart. A deployment serving this workflow needs requests
-to reach the same process; otherwise subsequent requests can return `404`.
-There is no list, delete, export, chat-message append, or session recovery API.
+Sessions, revision feedback, and original evidence are persisted in Cosmos DB
+and shared between application processes. `expires_at` is fixed 30 days after
+`created_at`; reads, revisions, and acceptance do not extend it. Cosmos TTL
+removes expired documents in the background. The API rejects expired sessions
+even if physical deletion has not completed. Accepted historical Q&A in
+`qa_memory` is separate and is not deleted by session expiry.
+
+Persist the current `conversation_id` in browser localStorage immediately after
+creation succeeds. On page load, retrieve that session through GET. Clear the
+stored ID on `404`; retain it on network errors or `503` so recovery can be
+retried. Store no session content in localStorage. Scope the storage key to the
+API origin, signed-in user, and course to keep workspaces separate. The API still
+has no list, delete, export, or chat-message append operation.
 
 ## Errors and retry behavior
 
@@ -242,10 +267,15 @@ Session errors use `{"detail": "..."}`:
 
 | HTTP status | Endpoint/action | Exact `detail` |
 | --- | --- | --- |
-| `404` | Any operation on an unknown session | `Reply session not found` |
+| `404` | Any operation on an unknown or expired session | `Reply session not found` |
 | `409` | Generate in an invalid state | `Session is not ready for generation` |
-| `409` | Review or accept outside `awaiting_review` | `Session is not awaiting review` |
+| `409` | Review outside `awaiting_review` | `Session is not awaiting review` |
+| `409` | Accept an unfinished generation/revision | `Session has no pending acceptance` |
+| `409` | QA Memory contains a newer accepted revision | `A newer accepted revision already exists in QA Memory` |
 | `409` | Revision helper detects an invalid state | `Session has no revision request` |
+| `409` | Conflicting session write | `Session changed; fetch it before retrying` |
+| `503` | Get | `The service could not retrieve the session` |
+| `503` | Review | `The service could not save the feedback` |
 | `503` | Create | `The service could not create a session` |
 | `503` | Generate | `The service could not generate a reply` |
 | `503` | Accept | `The service could not accept the reply` |
@@ -287,11 +317,11 @@ entire human-readable error message to drive frontend logic.
 - `503` or a network timeout: Show an actionable failure. For session mutations,
   fetch the session before deciding whether to repeat the action.
 
-There are no idempotency keys, conditional writes, or automatic deduplication
-for HTTP operations. Creation retries can create additional sessions. A request
-may have completed even if the browser never received its response. Historical
-Q&A storage uses a deterministic upsert ID internally, but this does not make
-`POST /accept` idempotent at the HTTP contract level.
+HTTP requests do not take idempotency keys or client ETags. Creation retries can
+create additional sessions, and generation/review should be retried only after
+checking current state. Server-side writes use versioned snapshots and
+conditional replacement. `/accept` is resumable and idempotent for a pinned
+acceptance decision, including when the browser never received the response.
 
 ## Minimal frontend request helper
 

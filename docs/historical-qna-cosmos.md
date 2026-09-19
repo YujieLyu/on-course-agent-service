@@ -1,8 +1,8 @@
 # Historical Q&A with Azure Cosmos DB
 
 The service stores only teacher-accepted replies. Each item uses `conversation_id`
-as its ID, so a retried accept request upserts the same item instead of creating a
-duplicate. Searches are restricted to the current `course_id` partition.
+as its ID. Revision checks and conditional writes make retries idempotent and
+prevent older decisions from overwriting newer accepted content. Searches are restricted to the current `course_id` partition.
 
 ## 1. Enable Cosmos DB vector search
 
@@ -70,10 +70,15 @@ Create the review session with course context:
 
 Continue using `/generate`, `/review`, and `/accept`. On `/accept`, the service:
 
-1. verifies that the session is awaiting review;
-2. embeds the original student query;
-3. upserts the query and final revision into Cosmos DB;
-4. marks the in-memory session as `accepted` only after the write succeeds.
+1. conditionally locks the reviewed revision in `accepting` state and persists
+   its immutable acceptance payload in the session;
+2. embeds the pinned student query;
+3. publishes the pinned revision with revision checks and conditional writes;
+4. marks the persisted reply session as `accepted` only after publication succeeds.
+
+Retries resume `accepting` sessions; accepted sessions return successfully
+without another publication. The [session recovery job](reply-session-persistence.md#writes-and-recovery)
+can finish pending decisions after a restart. No new container is required.
 
 The intent classifier can already select `historical_qna`. The orchestration layer
 now passes `course_id` to that search source, which executes a partition-scoped
@@ -85,8 +90,8 @@ now passes `course_id` to that search source, which executes a partition-scoped
   it. Managed identity/RBAC is preferable when the deployment supports it.
 - Historical answers are supporting context, not authoritative policy or current
   course material. The reply prompt already encodes this precedence.
-- The response-session store remains process-local. Persist sessions separately
-  before running multiple workers or requiring restart-safe review workflows.
+- Reply sessions use a separate `reply_sessions` container and expire 30 days
+  after creation. See [session persistence](reply-session-persistence.md).
 - `user_id` is used by the live request flow but is deliberately not copied into
   historical Q&A documents. Define retention/deletion rules for the query text as
   part of privacy compliance.
