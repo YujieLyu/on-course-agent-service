@@ -1,11 +1,15 @@
 from src.agents.context import format_conversation_context
-from src.agents.evidence_guard import enforce_evidence_guard
-from src.models import ChatMessage, IntentClassification, ReplyResponse, SearchResult, StudentIntent
+from src.domain.evidence import merge_citations
+from src.logger import get_logger
+from src.models import ChatMessage, IntentClassification, ReplyDraft, ReplyResponse, SearchResult
 from src.workflow.llm import (
     load_system_prompt,
     request_structured_output,
     supports_provider_conversation,
 )
+
+
+logger = get_logger(__name__)
 
 
 async def run_answer(
@@ -18,10 +22,15 @@ async def run_answer(
     conversation_id: str | None = None,
     intent_context: IntentClassification | None = None,
     is_revision: bool = False,
-    teacher_feedback: list[str] | None = None,
 ) -> ReplyResponse:
     system_prompt = load_system_prompt("reply_agent")
-    formatted_retrieved_context = _format_retrieved_context(retrieved_context or [])
+    # Revisions reuse the persisted retrieval order, so IDs remain stable without
+    # adding metadata to stored or public SearchResult objects.
+    sources = {
+        f"source_{index}": result
+        for index, result in enumerate(retrieved_context or [], start=1)
+    }
+    formatted_retrieved_context = _format_retrieved_context(sources)
     has_session = conversation_id is not None
     has_provider_conversation = supports_provider_conversation(conversation_id)
     instructions = system_prompt.substitute(
@@ -37,7 +46,7 @@ async def run_answer(
             else session_context or "No active reply session."
         ),
     )
-    response = await request_structured_output(
+    draft = await request_structured_output(
         client_type=client_type,
         model=model,
         instructions=instructions,
@@ -52,21 +61,21 @@ async def run_answer(
             if has_session
             else query
         ),
-        output_type=ReplyResponse,
+        output_type=ReplyDraft,
         request_name="Answer agent",
         conversation_id=conversation_id if has_provider_conversation else None,
     )
-    return await enforce_evidence_guard(
-        query=query,
-        response=response,
-        client_type=client_type,
-        model=model,
-        retrieved_context=retrieved_context or [],
-        chat_history=chat_history or [],
-        teacher_feedback=teacher_feedback or [],
-        allow_unreferenced_answer=(
-            intent_context is not None and intent_context.intent == StudentIntent.OUT_OF_SCOPE
-        ),
+    unknown_count = sum(source_id not in sources for source_id in draft.cited_source_ids)
+    if unknown_count:
+        logger.warning("reply.citations.unknown_sources", extra={"event_fields": {
+            "unknown_source_count": unknown_count,
+        }})
+    return ReplyResponse(
+        reply=draft.reply,
+        status=draft.status,
+        citations=list(merge_citations(
+            sources[source_id] for source_id in draft.cited_source_ids if source_id in sources
+        )),
     )
 
 
@@ -78,19 +87,17 @@ def _build_input(
     retrieved_context: str,
     is_revision: bool,
 ) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    if intent_context is not None or is_revision:
-        items.append(
-            {
-                "role": "developer",
-                "content": (
-                    "Intent classification:\n"
-                    f"{intent_context.model_dump_json() if intent_context else 'Not provided.'}\n\n"
-                    "Authoritative retrieved context:\n"
-                    f"{retrieved_context}"
-                ),
-            }
-        )
+    items: list[dict[str, str]] = [
+        {
+            "role": "developer",
+            "content": (
+                "Intent classification:\n"
+                f"{intent_context.model_dump_json() if intent_context else 'Not provided.'}\n\n"
+                "Authoritative retrieved context:\n"
+                f"{retrieved_context}"
+            ),
+        }
+    ]
 
     task = (
         "Revise the previous answer using the latest teacher feedback. "
@@ -111,17 +118,17 @@ def _build_input(
     return items
 
 
-def _format_retrieved_context(results: list[SearchResult]) -> str:
-    if not results:
+def _format_retrieved_context(sources: dict[str, SearchResult]) -> str:
+    if not sources:
         return "No retrieved context."
 
     formatted_results = []
-    for index, result in enumerate(results, start=1):
+    for source_id, result in sources.items():
         title = result.title or "Untitled source"
         source_url = f"\nurl: {result.source_url}" if result.source_url else ""
         excerpt = f"\nexcerpt: {result.excerpt}" if result.excerpt else ""
         formatted_results.append(
-            f"[{index}] source: {result.source}\n"
+            f"[{source_id}] source: {result.source}\n"
             f"title: {title}{source_url}{excerpt}\n"
             f"content: {result.content}"
         )

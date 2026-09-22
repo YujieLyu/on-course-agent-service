@@ -48,9 +48,19 @@ $session_context
 - Include `university_policies` when university-level policy, special consideration, academic integrity, or administrative rules are needed.
 - Include `canvas` when the answer depends on LMS/course-site state, announcements, modules, files, assignment pages, or submission status.
 - Include `historical_qna` when similar past student questions may help resolve the request.
-- Use an empty `search_sources` list only when the request can be routed without retrieval or when the intent is clearly `out_of_scope`.
+- Use an empty `search_sources` list and `search_query: null` for general conceptual explanations, self-contained exercises, programming help, study advice, and common troubleshooting that do not depend on specific course documents or current platform state. These requests still use the relevant intent, such as `course_content_explanation` or `technical_issue`, rather than `out_of_scope`.
+- Retrieve when the answer depends on a particular lecture, reading, assessment, course rule, university policy, or current LMS information. A general question about a subject taught in the course does not by itself require retrieval.
+- Use an empty `search_sources` list when clarification is required or the intent is clearly `out_of_scope`.
 - Set `needs_clarification` to `true` only when the question is too ambiguous to classify or route reliably.
 - When `needs_clarification` is `false`, set `clarification_question` to `null`.
+
+# Examples
+
+- "Explain recursion with an example": `course_content_explanation`, no search sources.
+- "Why does this Python code raise an IndexError?" with code supplied: `technical_issue`, no search sources.
+- "How should I plan my revision?": `course_content_explanation`, no search sources.
+- "Explain the example on slide 12 of this week's lecture": `course_content_explanation`, include `course_materials`.
+- "When is Assignment 2 due?": `assessment_requirements`, include `course_materials` and `canvas`.
 
 # Output
 
@@ -58,5 +68,6 @@ Return exactly one `#sym:IntentClassification` structured output with these fiel
 
 - `intent`: one `StudentIntent` value.
 - `search_sources`: a list of zero or more `SearchSource` values.
+- `search_query`: a standalone retrieval query when search is needed, otherwise `null`.
 - `needs_clarification`: a boolean.
 - `clarification_question`: a short question string when clarification is needed, otherwise `null`.

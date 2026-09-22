@@ -10,12 +10,12 @@ from azure.cosmos import ContainerProxy, CosmosClient
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 
 from src.config import REPLY_SESSION_RETENTION_SECONDS, load_cosmos_session_settings
+from src.domain.evidence import SearchResult, merge_citations
 from src.domain.reply_sessions import (
-    AcceptedReply, Clock, SessionConflictError, SessionNotFoundError, SessionSnapshot,
+    Clock, ReplySession, SessionConflictError, SessionNotFoundError, SessionSnapshot,
     StorageUnavailableError,
 )
 from src.domain.retention import utc_now
-from src.models import IntentClassification, ReplySession, SearchResult
 
 
 def validate_session_container(properties: dict) -> None:
@@ -73,11 +73,6 @@ class CosmosReplySessionRepository:
 
     def replace(self, snapshot: SessionSnapshot) -> SessionSnapshot:
         document = self._document(snapshot.session)
-        document.update(
-            intent_context=snapshot.intent_context.model_dump(mode="json") if snapshot.intent_context else None,
-            retrieved_context=[result.model_dump(mode="json") for result in snapshot.retrieved_context],
-            acceptance=snapshot.acceptance.model_dump(mode="json") if snapshot.acceptance else None,
-        )
         try:
             return self._snapshot(self.container.replace_item(
                 item=snapshot.session.conversation_id, body=document,
@@ -106,26 +101,26 @@ class CosmosReplySessionRepository:
             raise StorageUnavailableError("Could not list pending acceptances") from error
 
     def _document(self, session: ReplySession) -> dict[str, Any]:
-        remaining = (session.expires_at - self.clock()).total_seconds()
-        if remaining <= 0:
-            raise SessionNotFoundError(session.conversation_id)
+        remaining = session.remaining_lifetime(self.clock()).total_seconds()
         return {
             "id": session.conversation_id, "document_type": "reply_session",
             **session.model_dump(mode="json"),
-            "intent_context": None, "retrieved_context": [], "acceptance": None,
             "ttl": math.ceil(remaining),
         }
 
     @staticmethod
     def _snapshot(document: dict[str, Any]) -> SessionSnapshot:
+        data = {key: document[key] for key in ReplySession.model_fields if key in document}
+        # Read both legacy per-revision citations and the current session-level layout.
+        # Only the next normal write persists the converted layout.
+        citations = list(data.get("citations", []))
+        revisions = []
+        for revision in data.get("revisions", []):
+            citations.extend(revision.get("citations", []))
+            revisions.append({key: value for key, value in revision.items() if key != "citations"})
+        data["revisions"] = revisions
+        data["citations"] = merge_citations(SearchResult.model_validate(item) for item in citations)
         return SessionSnapshot(
-            session=ReplySession.model_validate({
-                key: document[key] for key in ReplySession.model_fields if key in document
-            }),
+            session=ReplySession.model_validate(data),
             version=document["_etag"],
-            intent_context=IntentClassification.model_validate(document["intent_context"])
-            if document.get("intent_context") is not None else None,
-            retrieved_context=tuple(SearchResult.model_validate(item) for item in document.get("retrieved_context", [])),
-            acceptance=AcceptedReply.model_validate(document["acceptance"])
-            if document.get("acceptance") is not None else None,
         )

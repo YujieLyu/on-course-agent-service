@@ -1,6 +1,6 @@
 # Reply-session persistence
 
-Every reply session is stored in Cosmos DB, including its question, revisions,
+Every reply session is stored in Cosmos DB, including its question, revisions, session citations,
 teacher feedback, original intent classification, and original retrieved evidence.
 HTTP and MCP workers use the same container. No in-memory fallback is used when
 the database is unavailable; the API returns `503`.
@@ -32,8 +32,27 @@ configuration error rather than silently bypassing the retention policy.
 
 Each session is one document with `id` equal to `conversation_id`. The partition
 key is `/id`, allowing point reads using the ID already present in the HTTP URL.
-Draft revisions and evidence are written together in one document; evidence is
-not exposed in the public session response. This container has no vector index.
+Draft text, accumulated citations, and original retrieval evidence are written
+together in one document. The public session exposes a top-level `citations`
+list containing sources actually used across generated replies; the full
+retrieval snapshot remains internal. Repeated source type, URL, and content
+combinations are deduplicated, preserving the first entry. Review and uncited
+answers retain earlier citations. Revisions contain only their number,
+feedback, and draft text. This container has no vector index.
+
+Generation assigns source IDs such as `source_1` using the order of the original
+retrieval results. The model returns selected IDs, which the answer agent resolves
+to original `SearchResult` objects before the draft and citations are saved.
+Revisions rebuild the same mapping from the persisted `retrieved_context` order,
+including after a restart; the cumulative citations list does not determine IDs.
+IDs require no additional document fields. Unknown IDs are ignored and counted
+in logs without rejecting the draft. Existing citations are not revalidated.
+
+On read, the repository merges any legacy per-revision citations with top-level
+citations without modifying the stored document. The next normal write persists
+only top-level citations. Records without stored citations return an empty list;
+the service does not infer citations from all retrieved sources. No separate
+data migration is required.
 
 `created_at` and `expires_at` are UTC timestamps. Expiry is fixed at creation plus
 30 days. Each write sets the item TTL to the remaining lifetime because Cosmos
@@ -101,12 +120,28 @@ records are not silently overwritten or repaired by the recovery job.
 
 ## Responsibility boundaries
 
-- `src/domain/reply_sessions.py`: storage-independent snapshots, immutable
-  acceptance payloads, repository protocols, and domain errors.
-- `src/reply_sessions.py`: creation, expiry policy, and state transitions using
-  injected repository and clock dependencies. No SDK, serialization, or LLM calls.
+- `src/domain/reply_sessions.py`: the immutable `ReplySession` aggregate owns
+  creation, fixed expiry, allowed transitions, revision numbering, original
+  evidence, and acceptance decisions. Operations take an explicit time and return
+  a new aggregate without I/O. Revisions and acceptance payloads are immutable;
+  revision and evidence collections are tuples. `SessionSnapshot` adds only the
+  opaque repository version to an aggregate. Repository protocols and domain
+  errors also live here.
+- `src/domain/evidence.py`: immutable evidence and intent values shared with
+  generation. These values have no dependency on HTTP response schemas.
+- `src/services/reply_sessions.py`: `ReplySessionService` coordinates reads and
+  domain operations. Its `_commit()` method is the single application entry point
+  for both session creation and conditional replacement, including the write-time
+  expiry check and successful-transition logging. It never reloads a snapshot
+  during commit or retries a conflicting business operation.
+- `src/models.py`: the public `ReplySession` response DTO retains the established
+  API schema name and projects only public fields. HTTP handlers explicitly
+  convert aggregates to this DTO; the full retrieval snapshot, acceptance payloads, and
+  storage versions are excluded. The DTO requires persisted timestamps instead
+  of inventing them during response validation.
 - `src/agents/orchestrator.py`: generation from supplied context and evidence;
-  revision generation neither reads nor writes the database.
+  revision generation receives the aggregate without its storage version and
+  neither reads nor writes the database. Prompt context uses the public projection.
 - `src/services/reply_acceptance.py`: claim, publish, finalize, and recovery.
 - `src/services/historical_qna.py`: embedding preparation through an injected
   embedding function and QA repository.
@@ -114,9 +149,17 @@ records are not silently overwritten or repaired by the recovery job.
   checks, and SDK exception translation. `_etag` never enters the public model.
 - `src/bootstrap.py`: production adapter and service composition.
 
+The same domain lifetime check runs at read and write boundaries. Both checks
+are necessary because a long-running generation or publication can cross expiry.
+Cosmos TTL uses that same remaining-lifetime calculation. Application services
+select the next workflow step, while domain operations enforce the transition
+rules. Recovery continues to publish only already-persisted acceptance decisions.
+
 Initial generation and revision each perform one session point read and one
 conditional write. The write uses the original snapshot version without a
 second read. A newer revision therefore invalidates stale work atomically.
+The aggregate split preserves the existing Cosmos document layout, including
+top-level evidence and acceptance fields, so no data migration is required.
 
 ## Browser recovery
 
@@ -147,6 +190,7 @@ to browser storage cannot automatically recover a session.
 
 Only submitted content is durable. Manual draft edits and unsubmitted notes are
 not saved; use the revision action to persist a changed draft. The current
-session response has no structured citation metadata, so the frontend requires
-teacher review and does not fabricate evidence. The session service does not yet
+session response exposes cumulative citation metadata at the top level, which
+the frontend can display as conversation sources. Teacher review still determines
+whether to accept a draft. The session service does not yet
 accept frontend preferences or surrounding host thread context.

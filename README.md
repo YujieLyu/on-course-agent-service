@@ -9,8 +9,8 @@ revision before publishing it and can be resumed after a failure.
 ## Features
 
 - Intent classification and source selection for student questions
-- Grounded draft generation with internal citation validation
-- Independent evidence review before a generated reply is returned
+- General explanations, problem-solving help, and practical guidance without mandatory retrieval
+- Course-aware draft generation with citations for retrieved information
 - Hybrid keyword/vector retrieval from Azure AI Search
 - University policy retrieval from configured public web pages
 - Course-scoped historical Q&A retrieval using Azure Cosmos DB vector search
@@ -22,30 +22,42 @@ and returns no results. Reply sessions and their evidence are stored in the
 Cosmos DB `reply_sessions` container. They survive service restarts and are
 shared between workers, and expire 30 days after creation.
 
-## Evidence guardrail
+## Answer generation
 
-Replies and session revisions are checked before they are returned. A separate
-review using `REPLY_MODEL_NAME` checks whether the evidence supports every factual
-claim and whether an `answered` reply resolves the question. The service validates
-the review's source IDs and quoted passages, then retains citations from the
-original retrieved sources in the internal answer result. A missing mention of
-an exam is not evidence that the exam does not exist; assignment rubrics do not
-establish exam requirements.
+Ordinary conceptual questions, self-contained exercises, programming help, and
+study advice can use the model's general knowledge without retrieved evidence.
+The intent classifier skips retrieval when the question does not depend on
+course-specific information. Empty or irrelevant search results do not prevent
+a general answer.
 
-Rejected drafts are replaced with a fixed `not_found` reply and empty citations.
-Drafts already labelled `not_found`, and factual answers with no evidence, use
-this fallback without another model call. Other drafts normally require one
-additional model call, increasing latency and token usage. A review dependency
-failure uses the existing HTTP 503 error path and never releases the unchecked
-draft. Semantic support is still judged by a model and can be misclassified;
-the guardrail does not replace correct course filtering or complete source data.
+Course-specific details such as deadlines, assessment formats, grading rules,
+and university policies still require supplied course information or explicit
+teacher confirmations in the prompt. Partial answers retain useful information
+and identify missing details, with `answered` status. `not_found` is reserved
+for unavailable course-specific information when no substantive part can be
+answered. Missing references to an exam do not establish that there is no exam.
 
-Session revisions reuse a persisted snapshot of the original retrieval and
+The draft text is returned without a separate evidence-review model call,
+quote-matching gate, or fixed fallback replacement. The model selects source IDs
+such as `source_1` in an internal `cited_source_ids` field. The service resolves
+those IDs to original retrieved `SearchResult` objects, preserving their text,
+URLs, titles, and excerpts. Unknown IDs are ignored and their count is logged;
+they do not block the answer. General-knowledge answers may have empty citations.
+Factual accuracy and whether a selected source supports the answer still rely
+on the generation prompt and teacher review. Initial generation uses one
+classification call and one answer call; a revision uses one answer call.
+
+Source IDs follow the retrieval order and remain stable when that saved snapshot
+is reused. Session revisions reuse a persisted snapshot of the original retrieval and
 may use explicit factual confirmations from teacher feedback. Previous assistant
 drafts and requests to change tone are not evidence. The public API returns the
-session and its draft texts; internal answer statuses and structured citations
-are not included. The guard logs its decision and reason without logging reply
-text, source passages, or feedback.
+session with revision history and a top-level `citations` list. Citations
+accumulate sources actually used across generated replies, deduplicated by
+source type, URL, and source text while preserving their first occurrence.
+Review and answers without new citations retain the accumulated list. New
+sessions and older records without citations return `[]`; legacy per-revision
+citations are merged on read. Internal answer statuses and the complete
+retrieval snapshot are not included.
 
 ## Prerequisites
 
@@ -285,6 +297,9 @@ types, session transitions, errors, and client examples. The accompanying
 [OpenAPI snapshot](docs/openapi.json) can be imported into API tooling.
 
 ### Import into Postman
+
+For a ready-to-run test collection covering every endpoint, request bodies,
+expected responses, and failure cases, see the [HTTP API test suite](docs/postman-testing.md).
 
 1. Select **Import** in Postman and choose `docs/openapi.json`, or enter
    `http://127.0.0.1:8000/openapi.json` while the service is running.
