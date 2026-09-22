@@ -7,16 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from main import app
-from src.agents.evidence_guard import EvidenceReference, EvidenceReview, insufficient_evidence_reply
 from src.models import (
     IntentClassification,
-    ReplyResponse,
+    ReplyDraft,
     SearchResult,
     SearchResults,
     SearchSource,
     StudentIntent,
 )
-from tests.fakes import make_session_store
+from tests.fakes import FakeSessionContainer, make_session_service
 from src.tools.search_providers import azure_ai_search, public_website_search
 
 
@@ -63,15 +62,6 @@ def fake_llm_client(*structured_outputs):
     )
 
 
-def supported_review(quote=None, *, answers_question=True):
-    return EvidenceReview(
-        claims_supported=True,
-        answers_question=answers_question,
-        has_factual_claims=quote is not None,
-        evidence=[EvidenceReference(evidence_id="source_1", quote=quote)] if quote else [],
-    )
-
-
 class FakeHeaders:
     def get_content_charset(self):
         return "utf-8"
@@ -96,7 +86,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
     def setUp(self):
         azure_ai_search._get_settings.cache_clear()
         public_website_search._get_settings.cache_clear()
-        self.store = make_session_store()
+        self.store = make_session_service()
         store_patch = patch("main.reply_sessions", self.store)
         store_patch.start()
         self.addCleanup(store_patch.stop)
@@ -112,7 +102,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         return self.client.post(
             f"/reply-sessions/{created.json()['conversation_id']}/generate")
 
-    def assert_generated(self, response, expected_reply):
+    def assert_generated(self, response, expected_reply, citations=()):
         self.assertEqual(response.status_code, 200)
         session = response.json()
         self.assertEqual(session["conversation_id"], "conv-reply-flow")
@@ -120,6 +110,7 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(session["revisions"], [{
             "revision_number": 1, "feedback": None, "revision_content": expected_reply,
         }])
+        self.assertEqual(session["citations"], [citation.model_dump(mode="json") for citation in citations])
         self.assertEqual(self.client.get("/reply-sessions/conv-reply-flow").json(), session)
 
     def test_health_check(self):
@@ -142,12 +133,12 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             title="Assignment One",
             source_url="https://course.example.test/assignment-one",
         )
-        answer = ReplyResponse(
+        answer = ReplyDraft(
             reply="Assignment One requires a PDF report.",
             status="answered",
-            citations=[citation],
+            cited_source_ids=["source_1"],
         )
-        llm_client = fake_llm_client(classification, answer, supported_review(citation.content))
+        llm_client = fake_llm_client(classification, answer)
         search_client = MagicMock()
         search_client.search.return_value = [
             {
@@ -155,7 +146,8 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
                 "content": citation.content,
                 "title": citation.title,
                 "source_url": citation.source_url,
-            }
+            },
+            {"source": "course_materials", "content": "Lectures run on Mondays.", "title": "Timetable"},
         ]
 
         with patch.dict(os.environ, TEST_ENV, clear=False), patch(
@@ -174,10 +166,11 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assert_generated(response, answer.reply)
-        self.assertEqual(llm_client.responses.parse.await_count, 3)
+        self.assert_generated(response, answer.reply, [citation])
+        self.assertEqual(len(self.store.load_snapshot("conv-reply-flow").session.retrieved_context), 2)
+        self.assertEqual(llm_client.responses.parse.await_count, 2)
         self.assertEqual(llm_client.embeddings.create.await_count, 1)
-        self.assertEqual(openai_constructor.call_count, 5)
+        self.assertEqual(openai_constructor.call_count, 4)
         llm_client.conversations.create.assert_awaited_once()
         search_constructor.assert_called_once()
         search_client.search.assert_called_once()
@@ -186,6 +179,9 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "instructions"
         ]
         answer_input = json.dumps(llm_client.responses.parse.await_args_list[1].kwargs["input"])
+        self.assertIs(llm_client.responses.parse.await_args_list[1].kwargs["text_format"], ReplyDraft)
+        self.assertIn("[source_1]", answer_input)
+        self.assertIn("[source_2]", answer_input)
         self.assertIn("What does Assignment One require?", classifier_instructions)
         self.assertEqual(llm_client.responses.parse.await_args_list[1].kwargs["conversation"], "conv-reply-flow")
         self.assertIn("Assignment One requires a PDF report.", answer_input)
@@ -206,12 +202,12 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             source_url="https://policy.example.test/ai-use",
             excerpt="Students must disclose generative AI use in assessments.",
         )
-        answer = ReplyResponse(
+        answer = ReplyDraft(
             reply="You must disclose generative AI use in assessments.",
             status="answered",
-            citations=[citation],
+            cited_source_ids=["source_1"],
         )
-        llm_client = fake_llm_client(classification, answer, supported_review(citation.content))
+        llm_client = fake_llm_client(classification, answer)
         html = (
             "<html><head><title>AI Use Policy</title></head>"
             "<body>Students must disclose generative AI use in assessments.</body>"
@@ -237,12 +233,11 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         source_text = "AI Use Policy Students must disclose generative AI use in assessments."
-        self.assert_generated(response, answer.reply)
-        evidence = list(self.store.load_snapshot("conv-reply-flow").retrieved_context)
-        self.assertEqual(evidence, [citation.model_copy(update={
-            "content": source_text, "excerpt": source_text,
-        })])
-        self.assertEqual(llm_client.responses.parse.await_count, 3)
+        original_citation = citation.model_copy(update={"content": source_text, "excerpt": source_text})
+        self.assert_generated(response, answer.reply, [original_citation])
+        evidence = list(self.store.load_snapshot("conv-reply-flow").session.retrieved_context)
+        self.assertEqual(evidence, [original_citation])
+        self.assertEqual(llm_client.responses.parse.await_count, 2)
         self.assertEqual(llm_client.embeddings.create.await_count, 2)
         mock_urlopen.assert_called_once()
         search_constructor.assert_not_called()
@@ -253,16 +248,16 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
 
     def test_empty_canvas_and_historical_sources_complete(self):
         classification = IntentClassification(
-            intent=StudentIntent.PERSONAL_STATUS,
+            intent=StudentIntent.ASSESSMENT_REQUIREMENTS,
             search_sources=[SearchSource.CANVAS, SearchSource.HISTORICAL_QNA],
-            search_query="student submission status",
+            search_query="assignment two deadline",
             needs_clarification=False,
             clarification_question=None,
         )
-        answer = ReplyResponse(
-            reply="I cannot access that information yet.",
+        answer = ReplyDraft(
+            reply="The deadline for Assignment Two is not available in the supplied course information.",
             status="not_found",
-            citations=[],
+            cited_source_ids=[],
         )
         llm_client = fake_llm_client(classification, answer)
 
@@ -277,21 +272,21 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             "src.tools.search_providers.historical_qna_search.search",
             new=AsyncMock(
                 return_value=SearchResults(
-                    query="student submission status",
+                    query="assignment two deadline",
                     results=[],
                 )
             ),
         ):
             response = self.generate_reply(
                 {
-                    "question": "Was my assignment submitted?",
+                    "question": "When is Assignment Two due?",
                     "user_id": "student-1",
                     "course_id": "course-1",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assert_generated(response, insufficient_evidence_reply().reply)
+        self.assert_generated(response, answer.reply)
         self.assertEqual(llm_client.responses.parse.await_count, 2)
         llm_client.embeddings.create.assert_not_awaited()
         search_constructor.assert_not_called()
@@ -308,14 +303,12 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
             needs_clarification=True,
             clarification_question="Which assessment do you mean?",
         )
-        answer = ReplyResponse(
+        answer = ReplyDraft(
             reply="Which assessment do you mean?",
             status="needs_clarification",
-            citations=[],
+            cited_source_ids=[],
         )
-        llm_client = fake_llm_client(
-            classification, answer, supported_review(answers_question=False),
-        )
+        llm_client = fake_llm_client(classification, answer)
 
         with patch.dict(os.environ, TEST_ENV, clear=False), patch(
             "src.workflow.llm.AsyncOpenAI",
@@ -339,70 +332,92 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         search_constructor.assert_not_called()
         mock_urlopen.assert_not_called()
 
-    def test_exam_claim_is_blocked_when_assessment_overview_does_not_support_it(self):
+    def test_partial_answer_is_preserved_with_retrieved_context(self):
         classification = IntentClassification(
             intent=StudentIntent.ASSESSMENT_REQUIREMENTS,
             search_sources=[SearchSource.COURSE_MATERIALS],
-            search_query="exam handwritten code pseudocode", needs_clarification=False,
+            search_query="assignment one format deadline", needs_clarification=False,
         )
-        unrelated = SearchResult(
+        source = SearchResult(
             source=SearchSource.COURSE_MATERIALS,
-            content="Projects/Assignments (85%). Take-home exercises (15%).",
-            title="Course Assessment",
+            content="Assignment One requires a PDF report.",
+            title="Assignment One",
         )
-        draft = ReplyResponse(
-            reply="There is no closed-book exam, so there is no handwritten code test.",
-            status="answered", citations=[unrelated],
+        draft = ReplyDraft(
+            reply="Submit a PDF report. The deadline is not available in the supplied instructions.",
+            status="answered", cited_source_ids=["source_1"],
         )
-        rejected = EvidenceReview(
-            claims_supported=False, answers_question=False, has_factual_claims=True, evidence=[],
-        )
-        llm = fake_llm_client(classification, draft, rejected)
-        search_client = MagicMock()
-        search_client.search.return_value = [unrelated.model_dump(mode="json")]
-        with patch.dict(os.environ, TEST_ENV), patch(
-            "src.workflow.llm.AsyncOpenAI", return_value=llm,
-        ), patch(
-            "src.tools.search_providers.azure_ai_search.SearchClient", return_value=search_client,
-        ):
-            response = self.generate_reply({
-                "question": "Is there a handwriting code test in the closed-book exam? Could we use pseudocode?",
-                "user_id": "student-1", "course_id": "course-1",
-            })
-        self.assertEqual(response.status_code, 200)
-        self.assert_generated(response, insufficient_evidence_reply().reply)
-        self.assertEqual(llm.responses.parse.await_count, 3)
-        review_request = llm.responses.parse.await_args.kwargs
-        self.assertIn(unrelated.content, review_request["input"])
-        self.assertIn(draft.reply, review_request["input"])
-        self.assertNotIn("conversation", review_request)
-
-    def test_evidence_review_failure_returns_service_error_instead_of_draft(self):
-        classification = IntentClassification(
-            intent=StudentIntent.ASSESSMENT_REQUIREMENTS,
-            search_sources=[SearchSource.COURSE_MATERIALS], needs_clarification=False,
-        )
-        source = SearchResult(source=SearchSource.COURSE_MATERIALS, content="Submit a PDF.")
-        draft = ReplyResponse(reply="Submit a PDF.", status="answered", citations=[source])
         llm = fake_llm_client(classification, draft)
-        llm.responses.parse.side_effect = [
-            parsed_response(classification), parsed_response(draft), RuntimeError("guard unavailable"),
-        ]
         search_client = MagicMock()
         search_client.search.return_value = [source.model_dump(mode="json")]
         with patch.dict(os.environ, TEST_ENV), patch(
             "src.workflow.llm.AsyncOpenAI", return_value=llm,
         ), patch(
             "src.tools.search_providers.azure_ai_search.SearchClient", return_value=search_client,
-        ), patch("main.logger.exception"):
+        ):
             response = self.generate_reply({
-                "question": "What should I submit?", "user_id": "u1", "course_id": "c1",
+                "question": "What format should I submit for Assignment One, and when is it due?",
+                "user_id": "student-1", "course_id": "course-1",
             })
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"detail": "The service could not generate a reply"})
-        self.assertEqual(self.store.get("conv-reply-flow").status, "pending_generation")
-        self.assertEqual(self.store.get("conv-reply-flow").revisions, [])
-        self.assertNotIn(draft.reply, response.text)
+        self.assertEqual(response.status_code, 200)
+        self.assert_generated(response, draft.reply, [source])
+        self.assertEqual(llm.responses.parse.await_count, 2)
+        self.assertEqual(list(self.store.load_snapshot("conv-reply-flow").session.retrieved_context), [source])
+
+    def test_general_question_is_answered_without_retrieval_or_evidence_review(self):
+        classification = IntentClassification(
+            intent=StudentIntent.COURSE_CONTENT_EXPLANATION,
+            search_sources=[], search_query=None, needs_clarification=False,
+        )
+        draft = ReplyDraft(
+            reply="Recursion solves a problem by calling the same function on smaller inputs until a base case is reached.",
+            status="answered", cited_source_ids=[],
+        )
+        llm = fake_llm_client(classification, draft)
+        with patch.dict(os.environ, TEST_ENV), patch(
+            "src.workflow.llm.AsyncOpenAI", return_value=llm,
+        ), patch(
+            "src.tools.search_providers.azure_ai_search.SearchClient",
+        ) as search_constructor, patch(
+            "src.tools.search_providers.public_website_search.urlopen",
+        ) as website_search, patch(
+            "src.tools.search_providers.historical_qna_search.search",
+        ) as historical_search:
+            response = self.generate_reply({
+                "question": "What is recursion?", "user_id": "u1", "course_id": "c1",
+            })
+        self.assert_generated(response, draft.reply)
+        self.assertEqual(llm.responses.parse.await_count, 2)
+        llm.embeddings.create.assert_not_awaited()
+        search_constructor.assert_not_called()
+        website_search.assert_not_called()
+        historical_search.assert_not_called()
+
+    def test_empty_retrieval_does_not_block_general_explanation(self):
+        classification = IntentClassification(
+            intent=StudentIntent.COURSE_CONTENT_EXPLANATION,
+            search_sources=[SearchSource.COURSE_MATERIALS],
+            search_query="recursion example", needs_clarification=False,
+        )
+        draft = ReplyDraft(
+            reply="A recursive function calls itself on a smaller input and stops at a base case.",
+            status="answered", cited_source_ids=[],
+        )
+        llm = fake_llm_client(classification, draft)
+        search_client = MagicMock()
+        search_client.search.return_value = []
+        with patch.dict(os.environ, TEST_ENV), patch(
+            "src.workflow.llm.AsyncOpenAI", return_value=llm,
+        ), patch(
+            "src.tools.search_providers.azure_ai_search.SearchClient", return_value=search_client,
+        ):
+            response = self.generate_reply({
+                "question": "Explain recursion with an example.", "user_id": "u1", "course_id": "c1",
+            })
+        self.assert_generated(response, draft.reply)
+        self.assertEqual(llm.responses.parse.await_count, 2)
+        search_client.search.assert_called_once()
+        self.assertIn("No retrieved context.", json.dumps(llm.responses.parse.await_args.kwargs["input"]))
 
     def test_invalid_request_is_rejected_before_external_calls(self):
         with patch("src.workflow.llm.AsyncOpenAI") as openai_constructor, patch(
@@ -420,6 +435,59 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(self.store.repository.snapshots, {})
         openai_constructor.assert_not_called()
         search_constructor.assert_not_called()
+
+    def test_revisions_resolve_stable_ids_from_persisted_retrieval_after_restart(self):
+        classification = IntentClassification(
+            intent=StudentIntent.ASSESSMENT_REQUIREMENTS,
+            search_sources=[SearchSource.COURSE_MATERIALS], needs_clarification=False,
+        )
+        sources = [
+            SearchResult(
+                source=SearchSource.COURSE_MATERIALS, content="The report is due Friday.",
+                title="Deadline", source_url="https://example.edu/deadline", excerpt="due Friday",
+            ),
+            SearchResult(
+                source=SearchSource.COURSE_MATERIALS, content="Submit a PDF report.",
+                title="Format", source_url="https://example.edu/format", excerpt="PDF report",
+            ),
+        ]
+        drafts = [
+            ReplyDraft(reply="Submit a PDF report.", status="answered", cited_source_ids=["source_2"]),
+            ReplyDraft(reply="Submit a PDF report by Friday.", status="answered", cited_source_ids=["source_1", "source_2", "source_99"]),
+            ReplyDraft(reply="Plan time to proofread your work.", status="answered", cited_source_ids=[]),
+        ]
+        llm = fake_llm_client(classification, *drafts)
+        container = FakeSessionContainer()
+        search_client = MagicMock()
+        search_client.search.return_value = [source.model_dump(mode="json") for source in sources]
+        with patch.dict(os.environ, TEST_ENV), patch(
+            "src.workflow.llm.AsyncOpenAI", return_value=llm,
+        ), patch(
+            "src.tools.search_providers.azure_ai_search.SearchClient", return_value=search_client,
+        ), patch("main.reply_sessions", make_session_service(container)):
+            initial = self.generate_reply({"question": "What should I submit?", "course_id": "course-1"})
+            self.assert_generated(initial, drafts[0].reply, [sources[1]])
+            session_id = initial.json()["conversation_id"]
+            restarted = make_session_service(container)
+            with patch("main.reply_sessions", restarted):
+                for index, draft in enumerate(drafts[1:], start=1):
+                    feedback = "Include the deadline." if index == 1 else "Give general proofreading advice."
+                    reviewed = self.client.post(f"/reply-sessions/{session_id}/review", json={"feedback": feedback})
+                    self.assertEqual(reviewed.status_code, 200)
+                    revised = self.client.post(f"/reply-sessions/{session_id}/generate")
+                    self.assertEqual(revised.status_code, 200)
+                    self.assertEqual(revised.json()["revisions"][-1]["revision_content"], draft.reply)
+                    self.assertEqual(revised.json()["citations"], [sources[1].model_dump(mode="json"), sources[0].model_dump(mode="json")])
+                    self.assertNotIn("cited_source_ids", revised.json())
+                    self.assertTrue(all("citations" not in revision for revision in revised.json()["revisions"]))
+        self.assertEqual(restarted.get(session_id).retrieved_context, tuple(sources))
+        self.assertEqual(len(restarted.get(session_id).revisions), 3)
+        search_client.search.assert_called_once()
+        self.assertEqual(llm.responses.parse.await_count, 4)
+        for request in llm.responses.parse.await_args_list[1:]:
+            registry = request.kwargs["input"][0]["content"]
+            self.assertIn("[source_1] source: course_materials\ntitle: Deadline", registry)
+            self.assertIn("[source_2] source: course_materials\ntitle: Format", registry)
 
     def test_search_failure_returns_a_structured_service_error(self):
         classification = IntentClassification(

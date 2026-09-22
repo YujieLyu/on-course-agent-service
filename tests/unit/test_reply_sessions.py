@@ -2,61 +2,24 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from pydantic import ValidationError
+
 from src.agents.reply_agent import run_answer
 from src.agents.orchestrator import generate_session_revision
-from src.agents.evidence_guard import EvidenceReference, EvidenceReview
 from src.models import (
     ClientType,
     IntentClassification,
-    ReplyResponse,
+    ReplyDraft,
     SearchResult,
     SearchSource,
-    SessionStatus,
     StudentIntent,
 )
-from src.domain.reply_sessions import InvalidSessionActionError
-from tests.fakes import make_session_store
+from tests.fakes import make_session_service
 
 
-class ReplySessionStoreTests(unittest.IsolatedAsyncioTestCase):
-    async def test_revision_numbers_and_status_transitions(self):
-        store = make_session_store()
-        session = store.create("conv_1", "What is due?", "course-1", "student-1")
-
-        self.assertEqual(session.status, SessionStatus.PENDING_GENERATION)
-        self.assertEqual(session.course_id, "course-1")
-        self.assertEqual(session.revisions, [])
-
-        session = store.save_generation(store.load_snapshot("conv_1"), "The report is due Friday.")
-        self.assertEqual(session.status, SessionStatus.AWAITING_REVIEW)
-        self.assertEqual(session.revisions[0].revision_number, 1)
-
-        session = store.request_revision("conv_1", "Make it friendlier.")
-        self.assertEqual(session.status, SessionStatus.REVISION_REQUESTED)
-        self.assertEqual(session.revisions[1].revision_number, 2)
-        self.assertIsNone(session.revisions[1].revision_content)
-
-        session = store.save_generation(store.load_snapshot("conv_1"), "Please submit it by Friday.")
-        self.assertEqual(session.status, SessionStatus.AWAITING_REVIEW)
-        self.assertEqual(
-            session.revisions[1].revision_content,
-            "Please submit it by Friday.",
-        )
-
-        pending = store.begin_acceptance(store.load_snapshot("conv_1"))
-        self.assertEqual(pending.session.status, SessionStatus.ACCEPTING)
-        session = store.complete_acceptance(pending)
-        self.assertEqual(session.status, SessionStatus.ACCEPTED)
-
-    async def test_invalid_action_is_rejected(self):
-        store = make_session_store()
-        store.create("conv_1", "What is due?", "course-1")
-
-        with self.assertRaises(InvalidSessionActionError):
-            store.request_revision("conv_1", "Change it.")
-
-    async def test_revisions_reuse_original_evidence_and_only_teacher_feedback_as_new_evidence(self):
-        store = make_session_store()
+class ReplySessionServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revisions_reuse_original_context_and_teacher_feedback_without_search(self):
+        store = make_session_service()
         classification = IntentClassification(
             intent=StudentIntent.ASSESSMENT_REQUIREMENTS,
             search_sources=[SearchSource.COURSE_MATERIALS], needs_clarification=False,
@@ -66,30 +29,31 @@ class ReplySessionStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         store.create("local_1", "Must we write code in the exam?", "course-1")
         store.save_generation(store.load_snapshot("local_1"), "There is no exam.", evidence=(classification, [original]))
-        original.content = "Mutated after retrieval"
-        snapshot = store.load_snapshot("local_1").retrieved_context
-        snapshot[0].content = "Mutated by caller"
+        with self.assertRaises(ValidationError):
+            original.content = "Mutated after retrieval"
+        snapshot = store.load_snapshot("local_1").session.retrieved_context
+        with self.assertRaises(ValidationError):
+            snapshot[0].content = "Mutated by caller"
         confirmation = "The exam does not require handwritten code. Pseudocode may be required."
         store.request_revision("local_1", confirmation)
-        draft = ReplyResponse(reply=confirmation, status="answered", citations=[])
+        draft = ReplyDraft(reply=confirmation, status="answered", cited_source_ids=["source_1"])
         answer_request = AsyncMock(return_value=draft)
-        review_request = AsyncMock(return_value=EvidenceReview(
-            claims_supported=True, answers_question=True, has_factual_claims=True,
-            evidence=[EvidenceReference(evidence_id="teacher_feedback_1", quote=confirmation)],
-        ))
         with patch("src.agents.reply_agent.request_structured_output", new=answer_request), patch(
-            "src.agents.evidence_guard.request_structured_output", new=review_request,
-        ), patch("src.agents.orchestrator.search") as search:
-            revised = await generate_session_revision(store.load_snapshot("local_1"))
+            "src.agents.orchestrator.search",
+        ) as search:
+            revised = await generate_session_revision(store.load_snapshot("local_1").session)
         search.assert_not_called()
         self.assertEqual(revised.reply, confirmation)
-        payload = json.loads(review_request.await_args.kwargs["input"])
-        self.assertEqual(payload["retrieved_sources"][0]["content"], "Pseudocode may be required in the exam.")
-        self.assertEqual(payload["teacher_feedback"], [{
-            "evidence_id": "teacher_feedback_1", "content": confirmation,
-        }])
-        self.assertNotIn("There is no exam.", review_request.await_args.kwargs["input"])
-        self.assertIn("Pseudocode may be required in the exam.", answer_request.await_args.kwargs["input"][0]["content"])
+        self.assertEqual(revised.citations, [original])
+        answer_request.assert_awaited_once()
+        messages = answer_request.await_args.kwargs["input"]
+        self.assertIn("Pseudocode may be required in the exam.", messages[0]["content"])
+        self.assertIn("[source_1]", messages[0]["content"])
+        self.assertNotIn("There is no exam.", messages[0]["content"])
+        session = json.loads(messages[1]["content"].split("Reply session:\n", 1)[1].split("\n\nTask:", 1)[0])
+        self.assertEqual(session["student_query"], "Must we write code in the exam?")
+        self.assertEqual(session["revisions"][-1]["feedback"], confirmation)
+        self.assertEqual(session["revisions"][-2]["revision_content"], "There is no exam.")
         self.assertIsNone(answer_request.await_args.kwargs["conversation_id"])
 
     async def test_initial_generation_stores_intent_and_search_in_developer_input(self):
@@ -105,18 +69,12 @@ class ReplySessionStoreTests(unittest.IsolatedAsyncioTestCase):
             title="Assignment One",
         )
         request = AsyncMock(
-            return_value=ReplyResponse(reply="Submit a PDF report.", status="answered", citations=[result])
+            return_value=ReplyDraft(reply="Submit a PDF report.", status="answered", cited_source_ids=["source_1"])
         )
 
         with patch(
             "src.agents.reply_agent.request_structured_output",
             new=request,
-        ), patch(
-            "src.agents.evidence_guard.request_structured_output",
-            new=AsyncMock(return_value=EvidenceReview(
-                claims_supported=True, answers_question=True, has_factual_claims=True,
-                evidence=[EvidenceReference(evidence_id="source_1", quote=result.content)],
-            )),
         ):
             await run_answer(
                 "What is required?",

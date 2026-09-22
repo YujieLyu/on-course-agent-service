@@ -1,13 +1,15 @@
-"""Session snapshots and persistence ports; no SDK or HTTP dependencies."""
+"""Immutable session aggregate, business rules, and persistence ports."""
 
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 
-from pydantic import ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from src.models import IntentClassification, ReplySession, SearchResult, StrictModel
+from src.domain.evidence import IntentClassification, SearchResult, merge_citations
+from src.domain.retention import SESSION_RETENTION
 
 
 class SessionNotFoundError(KeyError):
@@ -30,10 +32,10 @@ class QaMemoryConflictError(ValueError):
     """An accepted revision would overwrite newer or inconsistent QA content."""
 
 
-class AcceptedReply(StrictModel):
+class AcceptedReply(BaseModel):
     """Immutable acceptance decision, persisted before publishing QA Memory."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     conversation_id: str
     course_id: str
@@ -43,13 +45,127 @@ class AcceptedReply(StrictModel):
     accepted_at: datetime
 
 
+class SessionStatus(StrEnum):
+    PENDING_GENERATION = "pending_generation"
+    AWAITING_REVIEW = "awaiting_review"
+    REVISION_REQUESTED = "revision_requested"
+    ACCEPTING = "accepting"
+    ACCEPTED = "accepted"
+
+
+class Revision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    revision_number: int = Field(ge=1)
+    feedback: str | None = None
+    revision_content: str | None = None
+
+
+class ReplySession(BaseModel):
+    """Own session invariants; operations return new values and perform no I/O."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    conversation_id: str
+    course_id: str = Field(min_length=1)
+    user_id: str | None = None
+    student_query: str = Field(min_length=1)
+    created_at: datetime
+    expires_at: datetime
+    status: SessionStatus = SessionStatus.PENDING_GENERATION
+    revisions: tuple[Revision, ...] = ()
+    citations: tuple[SearchResult, ...] = ()
+    intent_context: IntentClassification | None = None
+    retrieved_context: tuple[SearchResult, ...] = ()
+    acceptance: AcceptedReply | None = None
+
+    @classmethod
+    def create(
+        cls, conversation_id: str, student_query: str, course_id: str,
+        *, now: datetime, user_id: str | None = None,
+    ) -> "ReplySession":
+        return cls(
+            conversation_id=conversation_id, student_query=student_query,
+            course_id=course_id, user_id=user_id, created_at=now,
+            expires_at=now + SESSION_RETENTION,
+        )
+
+    def remaining_lifetime(self, now: datetime) -> timedelta:
+        remaining = self.expires_at - now
+        if remaining <= timedelta(0):
+            raise SessionNotFoundError(self.conversation_id)
+        return remaining
+
+    def generation_is_revision(self, now: datetime) -> bool:
+        self._require_status(
+            now, (SessionStatus.PENDING_GENERATION, SessionStatus.REVISION_REQUESTED),
+            "Session is not ready for generation",
+        )
+        return self.status == SessionStatus.REVISION_REQUESTED
+
+    def request_revision(self, feedback: str, now: datetime) -> "ReplySession":
+        self._require_status(now, (SessionStatus.AWAITING_REVIEW,), "Session is not awaiting review")
+        revision = Revision(revision_number=len(self.revisions) + 1, feedback=feedback)
+        return self.model_copy(update={
+            "status": SessionStatus.REVISION_REQUESTED,
+            "revisions": (*self.revisions, revision),
+        })
+
+    def record_generation(
+        self, content: str, now: datetime, *,
+        citations: Iterable[SearchResult] = (),
+        evidence: tuple[IntentClassification, list[SearchResult]] | None = None,
+    ) -> "ReplySession":
+        if self.generation_is_revision(now):
+            revision = self.revisions[-1].model_copy(update={"revision_content": content})
+            return self.model_copy(update={
+                "status": SessionStatus.AWAITING_REVIEW,
+                "revisions": (*self.revisions[:-1], revision),
+                "citations": merge_citations(self.citations, citations),
+            })
+        intent, results = evidence if evidence is not None else (None, ())
+        return self.model_copy(update={
+            "status": SessionStatus.AWAITING_REVIEW,
+            "revisions": (Revision(revision_number=1, revision_content=content),),
+            "citations": merge_citations(self.citations, citations),
+            "intent_context": intent,
+            "retrieved_context": tuple(results),
+        })
+
+    def begin_acceptance(self, now: datetime) -> "ReplySession":
+        self._require_status(now, (SessionStatus.AWAITING_REVIEW,), "Session is not awaiting review")
+        revision = self.revisions[-1] if self.revisions else None
+        if revision is None or not revision.revision_content:
+            raise InvalidSessionActionError("Session has no generated reply to accept")
+        acceptance = AcceptedReply(
+            conversation_id=self.conversation_id, course_id=self.course_id,
+            student_query=self.student_query, revision_number=revision.revision_number,
+            accepted_response=revision.revision_content, accepted_at=now,
+        )
+        return self.model_copy(update={"status": SessionStatus.ACCEPTING, "acceptance": acceptance})
+
+    def pending_acceptance(self, now: datetime) -> AcceptedReply:
+        self._require_status(now, (SessionStatus.ACCEPTING,), "Session has no pending acceptance")
+        if self.acceptance is None:
+            raise InvalidSessionActionError("Session has no pending acceptance")
+        return self.acceptance
+
+    def complete_acceptance(self, now: datetime) -> "ReplySession":
+        self.pending_acceptance(now)
+        return self.model_copy(update={"status": SessionStatus.ACCEPTED})
+
+    def _require_status(
+        self, now: datetime, allowed: tuple[SessionStatus, ...], message: str,
+    ) -> None:
+        self.remaining_lifetime(now)
+        if self.status not in allowed:
+            raise InvalidSessionActionError(message)
+
+
 @dataclass(frozen=True)
 class SessionSnapshot:
     session: ReplySession
     version: str
-    intent_context: IntentClassification | None = None
-    retrieved_context: tuple[SearchResult, ...] = ()
-    acceptance: AcceptedReply | None = None
 
 
 @dataclass(frozen=True)

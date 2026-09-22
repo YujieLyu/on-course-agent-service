@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
 from src.logger import get_logger, log_operation
 from src.models import SearchResults, SearchSource
@@ -50,7 +50,7 @@ _SEARCH_METHODS: dict[SearchSource, SearchMethod] = {
 
 async def search(
     query: str,
-    search_sources: list[SearchSource | str],
+    search_sources: Sequence[SearchSource | str],
     course_id: str,
 ) -> SearchResults:
     """Run and combine all requested search methods for a query.

@@ -1,4 +1,4 @@
-"""In-memory Cosmos boundary for tests; production always uses Cosmos DB."""
+"""Domain repository and Cosmos boundary fakes; production always uses Cosmos DB."""
 
 from copy import deepcopy
 from dataclasses import replace
@@ -11,7 +11,7 @@ from src.models import IntentClassification, ReplyGeneration, ReplyResponse, Stu
 from src.domain.reply_sessions import SessionConflictError, SessionNotFoundError, SessionSnapshot
 from src.domain.retention import utc_now
 from src.repositories.reply_sessions import CosmosReplySessionRepository
-from src.reply_sessions import ReplySessionStore
+from src.services.reply_sessions import ReplySessionService
 
 
 class FakeSessionContainer:
@@ -71,7 +71,7 @@ class InMemorySessionRepository:
         with self.lock:
             if conversation_id not in self.snapshots:
                 raise SessionNotFoundError(conversation_id)
-            return deepcopy(self.snapshots[conversation_id])
+            return self.snapshots[conversation_id]
 
     def replace(self, snapshot):
         with self.lock:
@@ -84,9 +84,9 @@ class InMemorySessionRepository:
 
     def _write(self, snapshot):
         self.version += 1
-        saved = deepcopy(replace(snapshot, version=str(self.version)))
+        saved = replace(snapshot, version=str(self.version))
         self.snapshots[snapshot.session.conversation_id] = saved
-        return deepcopy(saved)
+        return saved
 
     def pending_ids(self, limit):
         with self.lock:
@@ -94,9 +94,9 @@ class InMemorySessionRepository:
                     if value.session.status == SessionStatus.ACCEPTING][:limit]
 
 
-def make_session_store(container: FakeSessionContainer | None = None, *, clock=utc_now) -> ReplySessionStore:
+def make_session_service(container: FakeSessionContainer | None = None, *, clock=utc_now) -> ReplySessionService:
     repository = CosmosReplySessionRepository(container, clock=clock) if container is not None else InMemorySessionRepository()
-    return ReplySessionStore(repository, clock=clock)
+    return ReplySessionService(repository, clock=clock)
 
 
 def generation_result(response: ReplyResponse) -> ReplyGeneration:

@@ -13,15 +13,15 @@ from src.domain.reply_sessions import (
 )
 from src.models import SessionStatus
 from src.repositories.historical_qna import CosmosQaMemoryRepository
-from src.reply_sessions import ReplySessionStore
+from src.services.reply_sessions import ReplySessionService
 from src.services.historical_qna import HistoricalQnaPublisher
 from src.services.reply_acceptance import accept_reply, recover_pending_acceptances
-from tests.fakes import FakeSessionContainer, make_session_store
+from tests.fakes import FakeSessionContainer, make_session_service
 
 
 class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.store = make_session_store()
+        self.store = make_session_service()
         self.store.create('conv-1', 'Question', 'course-1')
         self.store.save_generation(self.store.load_snapshot('conv-1'), 'Reviewed draft')
         self.qa = FakeSessionContainer(partition_field='course_id')
@@ -42,12 +42,12 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
             await accept_reply('conv-1', self.store, AsyncMock(side_effect=StorageUnavailableError('offline')))
         pending = self.store.load_snapshot('conv-1')
         self.assertEqual(pending.session.status, SessionStatus.ACCEPTING)
-        self.assertEqual(pending.acceptance.accepted_response, 'Reviewed draft')
-        restarted = ReplySessionStore(self.store.repository)
+        self.assertEqual(pending.session.acceptance.accepted_response, 'Reviewed draft')
+        restarted = ReplySessionService(self.store.repository)
         accepted = await accept_reply('conv-1', restarted, self.publisher.publish)
         self.assertEqual(accepted.status, SessionStatus.ACCEPTED)
-        self.assertEqual(restarted.load_snapshot('conv-1').acceptance, pending.acceptance)
-        self.assertEqual(self.qa.documents['conv-1']['accepted_at'], pending.acceptance.accepted_at.isoformat().replace('+00:00', 'Z'))
+        self.assertEqual(restarted.load_snapshot('conv-1').session.acceptance, pending.session.acceptance)
+        self.assertEqual(self.qa.documents['conv-1']['accepted_at'], pending.session.acceptance.accepted_at.isoformat().replace('+00:00', 'Z'))
         self.assertEqual(accepted.expires_at, pending.session.expires_at)
 
     async def test_finalization_failure_retries_without_rewriting_qa_or_acceptance_time(self):
@@ -73,7 +73,7 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_lost_write_acknowledgements_are_recoverable_at_every_step(self):
         for step in ('claim', 'qa', 'complete'):
             with self.subTest(step=step):
-                store = make_session_store()
+                store = make_session_service()
                 store.create('conv-1', 'Question', 'course-1')
                 store.save_generation(store.load_snapshot('conv-1'), 'Reviewed draft')
                 qa = FakeSessionContainer(partition_field='course_id')
@@ -96,7 +96,7 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(StorageUnavailableError):
                         await accept_reply('conv-1', store, publisher.publish)
                 self.assertIn(store.get('conv-1').status, (SessionStatus.ACCEPTING, SessionStatus.ACCEPTED))
-                result = await accept_reply('conv-1', ReplySessionStore(store.repository), publisher.publish)
+                result = await accept_reply('conv-1', ReplySessionService(store.repository), publisher.publish)
                 self.assertEqual(result.status, SessionStatus.ACCEPTED)
                 self.assertEqual(qa.documents['conv-1']['accepted_response'], 'Reviewed draft')
                 self.assertEqual(len(qa.documents), 1)
@@ -179,14 +179,14 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
             result = await recover_pending_acceptances(self.store.repository, self.store, publish)
         self.assertEqual((result.completed, result.failed), (1, ('conv-1',)))
         self.assertEqual(self.store.get('unapproved').status, SessionStatus.AWAITING_REVIEW)
-        restarted = ReplySessionStore(self.store.repository)
+        restarted = ReplySessionService(self.store.repository)
         result = await recover_pending_acceptances(self.store.repository, restarted, self.publisher.publish)
         self.assertEqual((result.completed, result.failed), (1, ()))
         self.assertEqual(set(self.qa.documents), {'conv-1', 'conv-2'})
 
     async def test_pending_acceptance_does_not_extend_retention(self):
         now = datetime(2026, 9, 19, tzinfo=UTC)
-        store = make_session_store(clock=lambda: now)
+        store = make_session_service(clock=lambda: now)
         created = store.create('expiring', 'Question', 'course-1')
         store.save_generation(store.load_snapshot('expiring'), 'Draft')
         now = created.expires_at - timedelta(seconds=1)
@@ -213,7 +213,7 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
 class AcceptanceApiTests(unittest.TestCase):
     def test_pending_acceptance_can_be_observed_and_retried_through_the_api(self):
-        store = make_session_store()
+        store = make_session_service()
         store.create('conv-api', 'Question', 'course-1')
         store.save_generation(store.load_snapshot('conv-api'), 'Draft')
         publish = AsyncMock(side_effect=[StorageUnavailableError('offline'), None])

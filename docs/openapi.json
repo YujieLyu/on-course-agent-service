@@ -480,6 +480,14 @@
             "type": "array",
             "title": "Revisions"
           },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            },
+            "type": "array",
+            "title": "Citations",
+            "description": "Deduplicated sources cited across all generated replies in this session."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -496,9 +504,12 @@
         "required": [
           "conversation_id",
           "course_id",
-          "student_query"
+          "student_query",
+          "created_at",
+          "expires_at"
         ],
-        "title": "ReplySession"
+        "title": "ReplySession",
+        "description": "Public response DTO; domain state and persistence metadata stay internal."
       },
       "ReviewReplySessionRequest": {
         "properties": {
@@ -551,6 +562,68 @@
           "revision_number"
         ],
         "title": "Revision"
+      },
+      "SearchResult": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SearchSource"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Content"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
+          },
+          "excerpt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excerpt"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source",
+          "content"
+        ],
+        "title": "SearchResult"
+      },
+      "SearchSource": {
+        "type": "string",
+        "enum": [
+          "course_materials",
+          "university_policies",
+          "historical_qna",
+          "canvas"
+        ],
+        "title": "SearchSource"
       },
       "SessionStatus": {
         "type": "string",

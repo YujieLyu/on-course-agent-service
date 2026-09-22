@@ -1,11 +1,12 @@
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from main import app
-from src.models import ReplyResponse
-from tests.fakes import generation_result, make_session_store
+from src.models import ReplyResponse, SearchResult, SearchSource
+from tests.fakes import generation_result, make_session_service
 
 
 class RemovedReplyEndpointTests(unittest.TestCase):
@@ -24,7 +25,7 @@ class ReplySessionEndpointTests(unittest.TestCase):
     def test_every_generated_reply_can_be_revised_multiple_times(self):
         for reply_status in ["answered", "needs_clarification", "not_found", "escalated", "error"]:
             with self.subTest(reply_status=reply_status), patch(
-                "main.reply_sessions", make_session_store(),
+                "main.reply_sessions", make_session_service(),
             ), patch(
                 "main.create_conversation", new=AsyncMock(return_value="conv_1"),
             ), patch(
@@ -58,12 +59,16 @@ class ReplySessionEndpointTests(unittest.TestCase):
                 self.assertEqual(client.get(session_path).json(), generated.json())
                 initial.assert_awaited_once()
                 self.assertEqual(revise.await_count, 2)
-                self.assertEqual(revise.await_args.kwargs["teacher_feedback"], ["Make it shorter.", "Explain the deadline."])
+                session_context = json.loads(revise.await_args.kwargs["session_context"])
+                self.assertEqual(
+                    [item["feedback"] for item in session_context["revisions"] if item["feedback"]],
+                    ["Make it shorter.", "Explain the deadline."],
+                )
 
     def test_failed_generation_preserves_state_and_can_be_retried(self):
         for is_revision in [False, True]:
             generation_target = "src.agents.orchestrator.run_answer" if is_revision else "main.run_orchestration"
-            store = make_session_store()
+            store = make_session_service()
             with self.subTest(is_revision=is_revision), patch("main.reply_sessions", store), patch(
                 "main.create_conversation", new=AsyncMock(return_value="conv_1"),
             ), patch(generation_target, new=AsyncMock(side_effect=[
@@ -87,17 +92,19 @@ class ReplySessionEndpointTests(unittest.TestCase):
                 self.assertEqual(retried.json()["revisions"][-1]["revision_content"], "Generated draft")
 
     def test_complete_review_flow_uses_openai_conversation(self):
+        initial_citation = SearchResult(source=SearchSource.COURSE_MATERIALS, content="Submit a report.")
+        revised_citation = SearchResult(source=SearchSource.COURSE_MATERIALS, content="The report is due Friday.")
         initial_orchestration = AsyncMock(
             return_value=generation_result(ReplyResponse(
-                reply="Initial draft", status="answered", citations=[]
+                reply="Initial draft", status="answered", citations=[initial_citation]
             ))
         )
         revision_generation = AsyncMock(
             return_value=ReplyResponse(
-                reply="Revised draft", status="answered", citations=[]
+                reply="Revised draft", status="answered", citations=[initial_citation, revised_citation]
             )
         )
-        with patch("main.reply_sessions", make_session_store()), patch(
+        with patch("main.reply_sessions", make_session_service()), patch(
             "main.create_conversation",
             new=AsyncMock(return_value="conv_1"),
         ), patch("main.run_orchestration", new=initial_orchestration), patch(
@@ -123,13 +130,26 @@ class ReplySessionEndpointTests(unittest.TestCase):
             )
             revised = client.post("/reply-sessions/conv_1/generate")
             accepted = client.post("/reply-sessions/conv_1/accept")
+            fetched = client.get("/reply-sessions/conv_1")
 
         self.assertEqual(created.json()["status"], "pending_generation")
         self.assertEqual(generated.json()["status"], "awaiting_review")
+        self.assertEqual(generated.json()["citations"], [initial_citation.model_dump(mode="json")])
         self.assertEqual(reviewed.json()["status"], "revision_requested")
         self.assertEqual(reviewed.json()["revisions"][1]["revision_number"], 2)
+        self.assertEqual(reviewed.json()["revisions"][0], generated.json()["revisions"][0])
+        self.assertEqual(reviewed.json()["citations"], generated.json()["citations"])
+        self.assertIsNone(reviewed.json()["revisions"][1]["revision_content"])
         self.assertEqual(revised.json()["revisions"][1]["revision_content"], "Revised draft")
         self.assertEqual(accepted.json()["status"], "accepted")
+        self.assertEqual(revised.json()["revisions"][0], generated.json()["revisions"][0])
+        self.assertEqual(revised.json()["citations"], [
+            initial_citation.model_dump(mode="json"), revised_citation.model_dump(mode="json"),
+        ])
+        self.assertTrue(all("citations" not in revision for revision in revised.json()["revisions"]))
+        self.assertEqual(accepted.json()["citations"], revised.json()["citations"])
+        self.assertEqual(accepted.json()["revisions"], revised.json()["revisions"])
+        self.assertEqual(fetched.json(), accepted.json())
         initial_orchestration.assert_awaited_once()
         revision_generation.assert_awaited_once()
         revision_call = revision_generation.await_args
@@ -138,7 +158,7 @@ class ReplySessionEndpointTests(unittest.TestCase):
         self.assertIn("Make it friendlier.", revision_call.kwargs["session_context"])
 
     def test_failed_qa_publication_leaves_a_recoverable_acceptance(self):
-        store = make_session_store()
+        store = make_session_service()
 
         store.create("conv_1", "What is due?", "course-1")
         store.save_generation(store.load_snapshot("conv_1"), "Friday.")

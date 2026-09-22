@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 from src.bootstrap import save_accepted_qna
 from src.repositories.reply_sessions import CosmosReplySessionRepository
-from src.reply_sessions import ReplySessionStore
+from src.services.reply_sessions import ReplySessionService
 from src.services.reply_acceptance import recover_pending_acceptances
 
 
@@ -19,7 +19,7 @@ def main() -> None:
         parser.error("--limit must be positive")
     repository = CosmosReplySessionRepository()
     result = asyncio.run(recover_pending_acceptances(
-        repository, ReplySessionStore(repository), save_accepted_qna, limit=args.limit,
+        repository, ReplySessionService(repository), save_accepted_qna, limit=args.limit,
     ))
     print(json.dumps(asdict(result)))
     if result.failed:

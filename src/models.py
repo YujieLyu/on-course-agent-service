@@ -4,7 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.domain.retention import SESSION_RETENTION, utc_now
+from src.domain.evidence import IntentClassification, SearchResult, SearchSource, StudentIntent
+from src.domain.reply_sessions import Revision, SessionStatus
 
 
 class StrictModel(BaseModel):
@@ -12,58 +13,16 @@ class StrictModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+
 class ClientType(StrEnum):
-    OPENAI="openai"
-    ANTHROPIC="anthropic"
-
-class StudentIntent(StrEnum):
-    COURSE_CONTENT_EXPLANATION = "course_content_explanation"
-    COURSE_SCHEDULE_AND_OPERATIONS = "course_schedule_and_operations"
-    ASSESSMENT_REQUIREMENTS = "assessment_requirements"
-    SUBMISSION_HELP = "submission_help"
-    GRADING_AND_RUBRIC = "grading_and_rubric"
-    EXTENSION_AND_SPECIAL_CONSIDERATION = "extension_and_special_consideration"
-    ACADEMIC_INTEGRITY = "academic_integrity"
-    TECHNICAL_ISSUE = "technical_issue"
-    PERSONAL_STATUS = "personal_status"
-    ADMINISTRATIVE_REQUEST = "administrative_request"
-    STAFF_CONTACT = "staff_contact"
-    OUT_OF_SCOPE = "out_of_scope"
-
-
-class SearchSource(StrEnum):
-    COURSE_MATERIALS = "course_materials"
-    UNIVERSITY_POLICIES = "university_policies"
-    HISTORICAL_QNA = "historical_qna"
-    CANVAS= "canvas"
-
-
-class SearchResult(StrictModel):
-    source: SearchSource
-    content: str = Field(min_length=1)
-    title: str | None = None
-    source_url: str | None = None
-    excerpt: str | None = None
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
 
 
 class SearchResults(StrictModel):
     query: str = Field(min_length=1)
     results: list[SearchResult]
 
-
-class IntentClassification(StrictModel):
-    """MVP routing decision produced by the student-question intent classifier."""
-
-    intent: StudentIntent
-    search_sources: list[SearchSource] = Field(
-        description="Search sources needed to answer the question; use an empty list when no search is needed."
-    )
-    search_query: str | None = Field(
-        default=None,
-        description="Standalone query optimized for retrieval. Use null when no search is needed."
-    )
-    needs_clarification: bool
-    clarification_question: str | None = None
 
 class ChatMessage(StrictModel):
     role: Literal["user", "assistant"]
@@ -79,17 +38,25 @@ class ReplyRequest(StrictModel):
     course_id: str
     chat_history: list[ChatMessage] = Field(default_factory=list)
 
-class ReplyResponse(StrictModel):
-    """Internal generated answer used by orchestration and evidence checks."""
+
+ReplyStatus = Literal["answered", "needs_clarification", "not_found", "escalated", "error"]
+
+
+class ReplyDraft(StrictModel):
+    """Model output selects retrieved source IDs; source objects are resolved by the service."""
 
     reply: str
-    status: Literal[
-        "answered",
-        "needs_clarification",
-        "not_found",
-        "escalated",
-        "error",
-    ]
+    status: ReplyStatus
+    cited_source_ids: list[str] = Field(
+        description="IDs of retrieved sources used in this answer, such as source_1; empty when none are used."
+    )
+
+
+class ReplyResponse(StrictModel):
+    """Generated answer with original source objects resolved from model-selected IDs."""
+
+    reply: str
+    status: ReplyStatus
     citations: list[SearchResult]
 
 
@@ -107,29 +74,22 @@ class ReplyGeneration(StrictModel):
     retrieved_context: list[SearchResult]
 
 
-class SessionStatus(StrEnum):
-    PENDING_GENERATION = "pending_generation"
-    AWAITING_REVIEW = "awaiting_review"
-    REVISION_REQUESTED = "revision_requested"
-    ACCEPTING = "accepting"
-    ACCEPTED = "accepted"
-
-
-class Revision(StrictModel):
-    revision_number: int = Field(ge=1)
-    feedback: str | None = None
-    revision_content: str | None = None
-
-
 class ReplySession(StrictModel):
+    """Public response DTO; domain state and persistence metadata stay internal."""
+
+    model_config = ConfigDict(from_attributes=True)
+
     conversation_id: str
     course_id: str = Field(min_length=1)
     user_id: str | None = None
     student_query: str = Field(min_length=1)
     status: SessionStatus = SessionStatus.PENDING_GENERATION
     revisions: list[Revision] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=utc_now)
-    expires_at: datetime = Field(default_factory=lambda: utc_now() + SESSION_RETENTION)
+    citations: list[SearchResult] = Field(
+        default_factory=list, description="Deduplicated sources cited across all generated replies in this session."
+    )
+    created_at: datetime
+    expires_at: datetime
 
 
 class CreateReplySessionRequest(StrictModel):

@@ -1,8 +1,9 @@
 # Frontend API Contract
 
 This contract describes the implemented HTTP API in `main.py`, the wire models
-in `src/models.py`, and the session behavior in `src/reply_sessions.py` as of
-2026-09-19. It describes current behavior, including integration limitations;
+in `src/models.py`, the rules in `src/domain/reply_sessions.py`, and the application
+operations in `src/services/reply_sessions.py` as of 2026-09-22.
+It describes current behavior, including integration limitations;
 it does not propose additional endpoints.
 
 ## Connection and conventions
@@ -87,6 +88,14 @@ export interface ReviewReplySessionRequest {
   feedback: string; // Minimum length: 1.
 }
 
+export interface SearchResult {
+  source: "course_materials" | "university_policies" | "historical_qna" | "canvas";
+  content: string; // Cited source text; minimum length: 1.
+  title: string | null;
+  source_url: string | null;
+  excerpt: string | null;
+}
+
 export interface Revision {
   revision_number: number; // Integer >= 1.
   feedback: string | null;
@@ -100,6 +109,7 @@ export interface ReplySession {
   student_query: string; // The question submitted during creation.
   status: SessionStatus;
   revisions: Revision[]; // Ordered oldest to newest.
+  citations: SearchResult[]; // Deduplicated sources used across all generated replies.
   created_at: string; // UTC ISO 8601 timestamp.
   expires_at: string; // Fixed at 30 days after creation.
 }
@@ -161,6 +171,7 @@ Response (`201`):
   "student_query": "When is Assignment 1 due?",
   "status": "pending_generation",
   "revisions": [],
+  "citations": [],
   "created_at": "2026-09-19T00:00:00Z",
   "expires_at": "2026-10-19T00:00:00Z"
 }
@@ -177,20 +188,50 @@ No body. From `pending_generation`, generates the first answer and returns the
 full session with `status: "awaiting_review"` and:
 
 ```json
-"revisions": [
-  {"revision_number": 1, "feedback": null, "revision_content": "Initial draft answer."}
-]
+{
+  "revisions": [
+    {
+      "revision_number": 1,
+      "feedback": null,
+      "revision_content": "Submit a PDF report."
+    }
+  ],
+  "citations": [
+    {
+      "source": "course_materials",
+      "content": "Assignment One requires a PDF report.",
+      "title": "Assignment One",
+      "source_url": null,
+      "excerpt": null
+    }
+  ]
+}
 ```
 
 From `revision_requested`, fills the latest pending revision's
-`revision_content` and returns to `awaiting_review`. Revision generation uses
+`revision_content`, merges newly used sources into the session's top-level
+`citations`, and returns to `awaiting_review`. Revision generation uses
 existing conversation/session context; it does not run fresh intent
 classification and retrieval.
 
-Only `ReplyResponse.reply` is stored in a session. The answer-level `status` and
-`citations` are discarded, including on the first generation. Consequently,
-`awaiting_review` does not imply the answer was classified as `answered`.
-The frontend cannot obtain structured citations for a session through this API.
+The new revision text and updated session citations are saved atomically.
+`citations` is a cumulative list of sources actually used across generated
+answers, not the complete retrieval snapshot or a mapping to individual
+versions. Entries with the same `source`, `source_url`, and `content` are merged,
+preserving the first entry and its metadata. Different passages from the same
+URL remain separate. An answer with no new citations retains the existing list.
+New sessions and legacy records without citations return `[]`. Stored legacy
+per-revision citations are merged into the top-level list when read.
+
+For newly generated answers, citation objects come from the original retrieved
+sources. The model selects internal source IDs; the service resolves them to
+the original source text and metadata. Unknown IDs are ignored without rejecting
+the answer. These IDs and the model's `cited_source_ids` field are not public
+response fields. Existing stored citations are retained as recorded.
+
+The answer-level `status` remains internal. `awaiting_review` does not imply the
+answer was classified as `answered`. Generate, review, GET, and accept continue
+to return the same `ReplySession` model, including top-level citations.
 
 ### 3. Request changes: `POST /reply-sessions/{conversation_id}/review`
 
@@ -215,7 +256,8 @@ pending revision; it does not generate the revised answer:
 ```
 
 Call `/generate` next. Keep displaying the latest non-null `revision_content`
-while a new revision is pending. The feedback belongs to the revision it asks
+while a new revision is pending. The top-level `citations` list stays unchanged
+during review and can be displayed as the conversation's sources. The feedback belongs to the revision it asks
 the backend to generate, not to the previous entry. The API does not support
 editing feedback, directly submitting an edited answer, or selecting an older
 revision for acceptance.
@@ -272,7 +314,6 @@ Session errors use `{"detail": "..."}`:
 | `409` | Review outside `awaiting_review` | `Session is not awaiting review` |
 | `409` | Accept an unfinished generation/revision | `Session has no pending acceptance` |
 | `409` | QA Memory contains a newer accepted revision | `A newer accepted revision already exists in QA Memory` |
-| `409` | Revision helper detects an invalid state | `Session has no revision request` |
 | `409` | Conflicting session write | `Session changed; fetch it before retrying` |
 | `503` | Get | `The service could not retrieve the session` |
 | `503` | Review | `The service could not save the feedback` |

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -8,7 +9,7 @@ from fastmcp import Client
 
 from mcp_server import create_mcp_server
 from src.models import ReplySession
-from tests.fakes import make_session_store
+from tests.fakes import make_session_service
 
 
 class McpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -23,6 +24,8 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                 course_id="course-1",
                 student_query="When is the assignment due?",
                 status=status,
+                created_at=datetime(2026, 9, 1, tzinfo=UTC),
+                expires_at=datetime(2026, 10, 1, tzinfo=UTC),
             ).model_dump(mode="json")
 
         @api.post("/reply-sessions")
@@ -184,7 +187,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_injection_cannot_accept_a_real_session(self):
         from main import app
 
-        store = make_session_store()
+        store = make_session_service()
         store.create("conv-1", "Question", "course-1")
         store.save_generation(store.load_snapshot("conv-1"), "Draft")
         with patch("main.reply_sessions", store), patch("main.save_accepted_qna", new=AsyncMock()) as persist:
@@ -207,7 +210,11 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
 
         @api.get("/reply-sessions/{conversation_id}")
         async def get_session(conversation_id: str):
-            return ReplySession(conversation_id=conversation_id, course_id="c1", student_query="Question")
+            return ReplySession(
+                conversation_id=conversation_id, course_id="c1", student_query="Question",
+                created_at=datetime(2026, 9, 1, tzinfo=UTC),
+                expires_at=datetime(2026, 10, 1, tzinfo=UTC),
+            )
 
         async with Client(create_mcp_server(api, timeout_seconds=0.02)) as client:
             result = await asyncio.wait_for(client.call_tool("generate_session_reply", {"conversation_id": "conv-1"}, raise_on_error=False), timeout=1)

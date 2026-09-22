@@ -15,29 +15,27 @@ from mcp.client.stdio import stdio_client
 
 from main import app
 from mcp_server import create_mcp_server
-from src.models import IntentClassification, ReplyResponse, StudentIntent
-from tests.fakes import generation_result, make_session_store
-from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client, supported_review
+from src.models import IntentClassification, ReplyDraft, ReplyResponse, SearchResult, SearchSource, StudentIntent
+from tests.fakes import generation_result, make_session_service
+from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client
 
 
 class McpFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_workflow_through_api_and_external_boundaries(self):
         classification = IntentClassification(
-            intent=StudentIntent.OUT_OF_SCOPE,
+            intent=StudentIntent.COURSE_CONTENT_EXPLANATION,
             search_sources=[], needs_clarification=False,
         )
-        initial = ReplyResponse(reply="Initial answer", status="answered", citations=[])
-        revision = ReplyResponse(reply="Revised answer", status="answered", citations=[])
-        llm = fake_llm_client(
-            classification, initial, supported_review(), revision, supported_review(),
-        )
+        initial = ReplyDraft(reply="Initial answer", status="answered", cited_source_ids=[])
+        revision = ReplyDraft(reply="Revised answer", status="answered", cited_source_ids=[])
+        llm = fake_llm_client(classification, initial, revision)
         llm.conversations = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(id="conv-workflow")))
         container = Mock()
         from azure.cosmos.exceptions import CosmosResourceNotFoundError
         container.read_item.side_effect = CosmosResourceNotFoundError(status_code=404)
         settings = {"embedding_dimensions": 3}
 
-        with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", make_session_store()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.bootstrap.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
+        with patch.dict(os.environ, TEST_ENV), patch("main.reply_sessions", make_session_service()), patch("src.workflow.llm.AsyncOpenAI", return_value=llm), patch("src.bootstrap.load_cosmos_qna_settings", return_value=settings), patch("src.repositories.historical_qna._get_container", return_value=container):
             async with Client(create_mcp_server(app)) as client:
                 created = await client.call_tool("create_reply_session", {"question": "Question", "course_id": "course-1"})
                 conversation_id = created.structured_content["conversation_id"]
@@ -58,14 +56,15 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
         item = container.create_item.call_args.kwargs["body"]
         self.assertEqual(item["accepted_response"], "Revised answer")
         self.assertEqual(item["id"], conversation_id)
-        self.assertEqual(llm.responses.parse.await_count, 5)
+        self.assertEqual(llm.responses.parse.await_count, 3)
 
     async def test_streamable_http_discovers_and_calls_typed_tools(self):
         server = create_mcp_server(app)
         http_app = server.http_app(path="/mcp", stateless_http=True, json_response=True)
-        answer = ReplyResponse(reply="HTTP answer", status="answered", citations=[])
+        citation = SearchResult(source=SearchSource.COURSE_MATERIALS, content="Submit a PDF report.")
+        answer = ReplyResponse(reply="Submit a PDF report.", status="answered", citations=[citation])
         headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-11-25"}
-        with patch("main.reply_sessions", make_session_store()), patch(
+        with patch("main.reply_sessions", make_session_service()), patch(
             "main.create_conversation", new=AsyncMock(return_value="conv-http"),
         ), patch("main.run_orchestration", new=AsyncMock(return_value=generation_result(answer))):
             async with http_app.router.lifespan_context(http_app):
@@ -87,6 +86,8 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                     session = generated.json()["result"]["structuredContent"]
                     self.assertEqual(session["status"], "awaiting_review")
                     self.assertEqual(session["revisions"][-1]["revision_content"], answer.reply)
+                    self.assertEqual(session["citations"], [citation.model_dump(mode="json")])
+                    self.assertNotIn("citations", session["revisions"][-1])
 
     async def test_stdio_process_keeps_protocol_and_logs_separate(self):
         root = Path(__file__).resolve().parents[2]

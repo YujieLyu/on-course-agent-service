@@ -21,7 +21,7 @@ from main import app
 from src.logger import get_log_context, get_logger, log_context, log_operation
 from src.models import (
     CreateReplySessionRequest,
-    ReplySession,
+    ReplySession as ReplySessionResponse,
     ReviewReplySessionRequest,
 )
 
@@ -181,31 +181,31 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
         question: NonEmptyString,
         course_id: NonEmptyString,
         user_id: str | None = None,
-    ) -> ReplySession:
+    ) -> ReplySessionResponse:
         """Create a reply session that can be generated and reviewed."""
         return await api.call(
             "POST",
             "/reply-sessions",
-            ReplySession,
+            ReplySessionResponse,
             CreateReplySessionRequest(question=question, course_id=course_id, user_id=user_id),
         )
 
     @mcp.tool(
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
-    async def get_reply_session(conversation_id: ConversationId) -> ReplySession:
+    async def get_reply_session(conversation_id: ConversationId) -> ReplySessionResponse:
         """Get the current status and revisions of a reply session."""
-        return await api.call("GET", f"/reply-sessions/{conversation_id}", ReplySession)
+        return await api.call("GET", f"/reply-sessions/{conversation_id}", ReplySessionResponse)
 
     @mcp.tool(
         annotations={"readOnlyHint": False, "destructiveHint": False},
     )
-    async def generate_session_reply(conversation_id: ConversationId) -> ReplySession:
+    async def generate_session_reply(conversation_id: ConversationId) -> ReplySessionResponse:
         """Generate the initial reply or the requested session revision."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/generate",
-            ReplySession,
+            ReplySessionResponse,
         )
 
     @mcp.tool(
@@ -214,24 +214,24 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
     async def request_reply_revision(
         conversation_id: ConversationId,
         feedback: NonEmptyString,
-    ) -> ReplySession:
+    ) -> ReplySessionResponse:
         """Request another reply revision using teacher feedback."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/review",
-            ReplySession,
+            ReplySessionResponse,
             ReviewReplySessionRequest(feedback=feedback),
         )
 
     @mcp.tool(
         annotations={"readOnlyHint": False, "destructiveHint": False},
     )
-    async def accept_reply_session(conversation_id: ConversationId) -> ReplySession:
+    async def accept_reply_session(conversation_id: ConversationId) -> ReplySessionResponse:
         """Accept a reply, resume pending acceptance, or return an already accepted reply."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/accept",
-            ReplySession,
+            ReplySessionResponse,
         )
 
     return mcp

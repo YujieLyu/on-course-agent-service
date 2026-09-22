@@ -7,9 +7,9 @@ from src.models import (
     ReplyRequest,
     ReplyGeneration,
     ReplyResponse,
-    SessionStatus,
+    ReplySession as ReplySessionResponse,
 )
-from src.domain.reply_sessions import InvalidSessionActionError, SessionSnapshot
+from src.domain.reply_sessions import ReplySession
 from src.tools.search import search
 
 
@@ -57,13 +57,10 @@ async def run_orchestration(
 
 
 async def generate_session_revision(
-    snapshot: SessionSnapshot,
+    session: ReplySession,
 ) -> ReplyResponse:
     """Generate a revision using context already stored in the conversation."""
-    session = snapshot.session
     conversation_id = session.conversation_id
-    if session.status != SessionStatus.REVISION_REQUESTED:
-        raise InvalidSessionActionError("Session has no revision request")
 
     with log_operation(
         logger, "reply.revise", conversation_id=conversation_id, course_id=session.course_id,
@@ -72,12 +69,9 @@ async def generate_session_revision(
             session.student_query,
             ClientType.OPENAI,
             reply_model_name,
-            session_context=session.model_dump_json(),
-            retrieved_context=list(snapshot.retrieved_context),
+            session_context=ReplySessionResponse.model_validate(session).model_dump_json(),
+            retrieved_context=list(session.retrieved_context),
             conversation_id=conversation_id,
-            intent_context=snapshot.intent_context,
+            intent_context=session.intent_context,
             is_revision=True,
-            teacher_feedback=[
-                revision.feedback for revision in session.revisions if revision.feedback
-            ],
         )
