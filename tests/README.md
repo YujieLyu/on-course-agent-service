@@ -1,62 +1,28 @@
-# Test Suites
+# MVP test coverage
 
-The test directory is divided into two suites:
+The suite covers initial generation, repeated feedback-driven review, accepted
+QA publication, and HTTP/MCP access. External calls are mocked; tests require no
+credentials, network access, or paid API capacity.
 
-- `unit`: pure domain tests plus focused tests that replace external dependencies with fakes or mocks.
-- `integration`: HTTP-level tests that execute the complete internal request flow from FastAPI through classification, routing, retrieval, answer generation, validation, and serialization.
+- `integration`: HTTP runs real retrieval adapters and answer generation with
+  fake OpenAI, search, website, and Cosmos clients. It verifies a workflow across
+  a service restart, stable source IDs, cumulative citations, and acceptance of
+  the latest revision. MCP exercises the same workflow, typed Streamable HTTP,
+  and a real STDIO subprocess.
+- `unit`: source mapping, parallel four-source retrieval and partial failure,
+  structured stateless model calls, session transitions, atomic persistence,
+  concurrency conflicts, expiry, and public response projection.
+- Acceptance and QA tests retain publication retry, cancellation, lost write
+  acknowledgements, immutable acceptance decisions, course-scoped retrieval,
+  version protection, and recovery. These protect the MVP's QA write path.
+- API and MCP tests retain input validation, safe errors, execution deadlines,
+  route protection, request correlation, and logs without question or reply text.
 
-Integration tests mock only external boundaries:
-
-- OpenAI client calls
-- Azure AI Search client calls
-- Public website HTTP requests
-- Session repository ports and Cosmos DB container operations
-
-No integration test sends network traffic or consumes paid API capacity.
-
-MCP coverage includes typed tool discovery, the complete review workflow,
-Streamable HTTP through an in-process ASGI transport, and a real STDIO subprocess.
-Regression tests cover removal of the direct-answer HTTP route and MCP tool,
-repeated revision of generated drafts, retryable generation failures,
-general answers without retrieval, cumulative session citations through HTTP and MCP,
-source-ID selection resolved to original source objects, ignored unknown IDs,
-and stable source IDs across revisions after a storage-backed restart,
-partial answers with citations, and specific
-missing-information replies without replacement by a fixed fallback,
-conversation-ID route injection, invalid session input, execution deadlines and cancellation, sanitized errors, request correlation,
-and payload-free logging. Cosmos boundary fakes also verify session recovery
-across service instances, fixed 30-day expiry, atomic draft/evidence writes, and
-conditional-write conflicts. Both initial generation and revision assert exactly
-one session read and one conditional write off the event loop. Acceptance tests
-cover claim conflicts, publish/finalization failures, cancellation, lost write
-acknowledgements at all three stages, restart recovery, concurrent publishers,
-fixed expiry, and version-protected QA writes. Business tests use a repository
-fake with no Azure document format; adapter tests exercise Cosmos serialization,
-conditional-write arguments, and SDK error translation. HTTP and MCP tests replace external dependencies;
-the STDIO smoke test discovers tools and checks a configuration failure without
-connecting to Cosmos DB.
-
-Domain tests exercise transition rules without storage, immutable nested values,
-original-evidence preservation, immutable citation snapshots, source deduplication,
-fixed expiry, and public-response projection.
-Persistence tests also verify expiry between a transition and its commit, and
-read literal pre-refactor documents, including pending acceptance and legacy
-accepted sessions without an acceptance payload or recorded citations. Legacy
-per-revision citations are merged on read and converted on the next write.
-The domain repository fake
-shares immutable snapshots directly rather than relying on defensive copies.
-
-Run unit tests:
-
-```bash
-uv run python -m unittest discover -s tests/unit -t . -v
-```
-
-Run integration tests:
-
-```bash
-uv run python -m unittest discover -s tests/integration -t . -v
-```
+Removed tests covered the deleted provider-conversation fallback, independent
+classification, the old review-then-generate protocol, legacy document migration,
+and evaluation-data scrubbing outside the service MVP. Repeated workflow and
+persistence assertions have been consolidated. There is no target test count;
+coverage follows the supported behavior.
 
 Run all tests:
 
@@ -64,4 +30,12 @@ Run all tests:
 uv run python -m unittest discover -s tests -t . -v
 ```
 
-Live OpenAI, Azure Search, and public website checks belong in the Postman E2E collection rather than the default automated test suite.
+Run one suite:
+
+```bash
+uv run python -m unittest discover -s tests/unit -t . -v
+uv run python -m unittest discover -s tests/integration -t . -v
+```
+
+Live provider checks and answer-quality evaluation are separate manual checks.
+Use disposable course data when testing acceptance against a live QA container.

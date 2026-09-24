@@ -1,7 +1,7 @@
 # Reply-session persistence
 
 Every reply session is stored in Cosmos DB, including its question, revisions, session citations,
-teacher feedback, original intent classification, and original retrieved evidence.
+teacher feedback and original retrieved evidence.
 HTTP and MCP workers use the same container. No in-memory fallback is used when
 the database is unavailable; the API returns `503`.
 
@@ -48,11 +48,15 @@ including after a restart; the cumulative citations list does not determine IDs.
 IDs require no additional document fields. Unknown IDs are ignored and counted
 in logs without rejecting the draft. Existing citations are not revalidated.
 
-On read, the repository merges any legacy per-revision citations with top-level
-citations without modifying the stored document. The next normal write persists
-only top-level citations. Records without stored citations return an empty list;
-the service does not infer citations from all retrieved sources. No separate
-data migration is required.
+Sessions use locally generated UUIDs; no provider conversation is created or
+continued. Model calls receive explicit context with `store=False`. The original
+retrieval is stored once. Each review reads the latest version, generates from
+saved sources plus feedback history, and appends a completed revision in one
+conditional write. There is no persisted pending-review state. Failed generation
+leaves both the feedback history and previous answer unchanged.
+
+This development schema does not migrate old pending revisions or per-revision
+citations. Create new sessions when switching to the one-request review API.
 
 `created_at` and `expires_at` are UTC timestamps. Expiry is fixed at creation plus
 30 days. Each write sets the item TTL to the remaining lifetime because Cosmos
@@ -127,10 +131,10 @@ records are not silently overwritten or repaired by the recovery job.
   revision and evidence collections are tuples. `SessionSnapshot` adds only the
   opaque repository version to an aggregate. Repository protocols and domain
   errors also live here.
-- `src/domain/evidence.py`: immutable evidence and intent values shared with
+- `src/domain/evidence.py`: immutable source values shared with
   generation. These values have no dependency on HTTP response schemas.
-- `src/services/reply_sessions.py`: `ReplySessionService` coordinates reads and
-  domain operations. Its `_commit()` method is the single application entry point
+- `src/services/reply_sessions.py`: `ReplySessionService` coordinates retrieval, answer
+  generation, direct review, and persistence. Its `_commit()` method is the single application entry point
   for both session creation and conditional replacement, including the write-time
   expiry check and successful-transition logging. It never reloads a snapshot
   during commit or retries a conflicting business operation.
@@ -139,9 +143,9 @@ records are not silently overwritten or repaired by the recovery job.
   convert aggregates to this DTO; the full retrieval snapshot, acceptance payloads, and
   storage versions are excluded. The DTO requires persisted timestamps instead
   of inventing them during response validation.
-- `src/agents/orchestrator.py`: generation from supplied context and evidence;
-  revision generation receives the aggregate without its storage version and
-  neither reads nor writes the database. Prompt context uses the public projection.
+- `src/agents/reply_agent.py`: one structured model call with explicit question,
+  sources, previous reply, and feedback history, followed by source-ID resolution.
+  No database access or provider conversation management.
 - `src/services/reply_acceptance.py`: claim, publish, finalize, and recovery.
 - `src/services/historical_qna.py`: embedding preparation through an injected
   embedding function and QA repository.
@@ -158,39 +162,21 @@ rules. Recovery continues to publish only already-persisted acceptance decisions
 Initial generation and revision each perform one session point read and one
 conditional write. The write uses the original snapshot version without a
 second read. A newer revision therefore invalidates stale work atomically.
-The aggregate split preserves the existing Cosmos document layout, including
-top-level evidence and acceptance fields, so no data migration is required.
+The completed reply, feedback, citations, and original sources stay in the same
+Cosmos document. Acceptance still uses its persisted, immutable decision.
 
 ## Browser recovery
 
-The `on-course/frontend` shared Answer surface implements this flow in API mode:
+Clients should save the conversation ID after creation and retrieve the session
+on reload. Clear the ID on `404`; retain it on network errors or `503`. Scope
+browser storage keys to the API origin, course, and user when available.
 
-```dotenv
-NEXT_PUBLIC_ONCOURSE_DATA_MODE=api
-NEXT_PUBLIC_ONCOURSE_API_BASE=http://127.0.0.1:8000
-```
+Keep unsent feedback in the UI while `/review` runs. Successful review responses
+already contain the new answer. Failed generation does not save that feedback;
+allow the user to retry it. After a timeout, GET the session to reconcile an
+uncertain write before resubmitting. Disable competing mutations while a request
+is running. Cosmos ETags also reject overlapping writes from different clients.
 
-Configure the deployed service origin instead when hosting the frontend. Restart
-Next.js after changing its environment. Browser requests use a same-origin
-`/api/reply-sessions` rewrite to the configured backend.
-
-The browser saves only the conversation ID in localStorage after session
-creation, before generation. On reload it calls
-`GET /reply-sessions/{conversation_id}` and restores the question, latest draft,
-submitted feedback, saved revision history, and status. `404` clears the ID;
-network errors and `503` retain it. Interrupted generation and revision can be
-resumed explicitly. Storage keys separate API origins, courses, surfaces, and
-host reply targets. Failed localStorage writes do not retry successful creation.
-
-The current frontend has no authenticated account identity; IDs are scoped to a
-browser profile. Add authenticated user scope and ownership checks when account
-authentication is introduced. Live Outlook recovery requires a message item ID;
-Canvas uses its existing reply target key. Hosts without a stable key or access
-to browser storage cannot automatically recover a session.
-
-Only submitted content is durable. Manual draft edits and unsubmitted notes are
-not saved; use the revision action to persist a changed draft. The current
-session response exposes cumulative citation metadata at the top level, which
-the frontend can display as conversation sources. Teacher review still determines
-whether to accept a draft. The session service does not yet
-accept frontend preferences or surrounding host thread context.
+Only completed revisions are durable. Manual answer edits and unsubmitted notes
+are not saved. Clients can display the top-level cumulative citations alongside
+the conversation, and explicitly accept the latest answer for QA publication.

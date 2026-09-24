@@ -155,8 +155,8 @@
         "tags": [
           "Reply Sessions"
         ],
-        "summary": "Generate or revise a session reply",
-        "description": "Generate the first draft for a pending_generation session, or revise a draft for a revision_requested session using teacher feedback and existing evidence. The updated session enters awaiting_review. No request body is required.",
+        "summary": "Generate the initial session reply",
+        "description": "Search all four sources and generate the first draft for a pending_generation session. The updated session enters awaiting_review. No request body is required.",
         "operationId": "generate_session_reply",
         "parameters": [
           {
@@ -201,7 +201,7 @@
             }
           },
           "503": {
-            "description": "The reply could not be generated or checked.",
+            "description": "The reply could not be generated.",
             "content": {
               "application/json": {
                 "schema": {
@@ -228,8 +228,8 @@
         "tags": [
           "Reply Sessions"
         ],
-        "summary": "Request a reply revision",
-        "description": "Record teacher feedback for an awaiting_review session and move it to revision_requested. Call the generate operation to produce the revised draft.",
+        "summary": "Revise a reply using teacher feedback",
+        "description": "Generate a revision using teacher feedback and the saved retrieval. Save feedback and the completed reply together, returning an awaiting_review session. A failed review leaves the previous version unchanged.",
         "operationId": "review_reply_session",
         "parameters": [
           {
@@ -284,7 +284,7 @@
             }
           },
           "503": {
-            "description": "The feedback could not be saved.",
+            "description": "The reply could not be revised.",
             "content": {
               "application/json": {
                 "schema": {
@@ -545,21 +545,15 @@
             "title": "Feedback"
           },
           "revision_content": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
             "title": "Revision Content"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "revision_number"
+          "revision_number",
+          "revision_content"
         ],
         "title": "Revision"
       },
@@ -630,7 +624,6 @@
         "enum": [
           "pending_generation",
           "awaiting_review",
-          "revision_requested",
           "accepting",
           "accepted"
         ],

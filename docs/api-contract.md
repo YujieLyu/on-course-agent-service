@@ -74,7 +74,6 @@ serialized as `null` when unset.
 export type SessionStatus =
   | "pending_generation"
   | "awaiting_review"
-  | "revision_requested"
   | "accepting"
   | "accepted";
 
@@ -99,7 +98,7 @@ export interface SearchResult {
 export interface Revision {
   revision_number: number; // Integer >= 1.
   feedback: string | null;
-  revision_content: string | null;
+  revision_content: string;
 }
 
 export interface ReplySession {
@@ -128,8 +127,7 @@ meaningful, nonblank user input.
 stateDiagram-v2
     [*] --> pending_generation: POST /reply-sessions
     pending_generation --> awaiting_review: POST /generate
-    awaiting_review --> revision_requested: POST /review
-    revision_requested --> awaiting_review: POST /generate
+    awaiting_review --> awaiting_review: POST /review generates and saves a revision
     awaiting_review --> accepting: POST /accept commits decision
     accepting --> accepted: QA publication confirmed
     accepting --> accepting: Retry pending publication
@@ -139,7 +137,6 @@ stateDiagram-v2
 | --- | --- | --- |
 | `pending_generation` | Generate | Generate draft |
 | `awaiting_review` | Review, accept | Show draft, request changes, accept |
-| `revision_requested` | Generate | Show feedback, generate revision |
 | `accepting` | Retry accept | Show pending QA save; disable revision |
 | `accepted` | Accept is an idempotent no-op | Show accepted answer |
 
@@ -177,8 +174,8 @@ Response (`201`):
 }
 ```
 
-Creation allocates a conversation and persists the session but does not generate
-an answer. Conversation creation or Cosmos persistence can fail with `503`. Save the returned
+Creation generates a local UUID and persists the session without calling the
+LLM or a provider conversation API. Cosmos persistence can fail with `503`. Save the returned
 `conversation_id` to address subsequent requests. There is no supported update
 to the original question, course, or user after creation.
 
@@ -208,11 +205,11 @@ full session with `status: "awaiting_review"` and:
 }
 ```
 
-From `revision_requested`, fills the latest pending revision's
-`revision_content`, merges newly used sources into the session's top-level
-`citations`, and returns to `awaiting_review`. Revision generation uses
-existing conversation/session context; it does not run fresh intent
-classification and retrieval.
+Generation is available only from `pending_generation`. It searches all four
+source adapters concurrently with the original question, then makes one answer
+call. Canvas currently returns no results. Each source has a 30-second deadline;
+failed sources are logged and omitted without discarding available results.
+Use `/review` for subsequent versions.
 
 The new revision text and updated session citations are saved atomically.
 `citations` is a cumulative list of sources actually used across generated
@@ -220,8 +217,7 @@ answers, not the complete retrieval snapshot or a mapping to individual
 versions. Entries with the same `source`, `source_url`, and `content` are merged,
 preserving the first entry and its metadata. Different passages from the same
 URL remain separate. An answer with no new citations retains the existing list.
-New sessions and legacy records without citations return `[]`. Stored legacy
-per-revision citations are merged into the top-level list when read.
+New sessions return `[]`. Citations are stored only at the session level.
 
 For newly generated answers, citation objects come from the original retrieved
 sources. The model selects internal source IDs; the service resolves them to
@@ -241,8 +237,10 @@ Requires `awaiting_review`. Request:
 {"feedback": "Make the answer shorter and include the late penalty."}
 ```
 
-Returns the full session with `status: "revision_requested"`. It appends a
-pending revision; it does not generate the revised answer:
+Returns the full session with `status: "awaiting_review"` and a completed
+revision. The request reuses the saved original sources, latest answer, and
+feedback history; it does not search again. Feedback and the generated answer
+are saved together with updated citations using one conditional write.
 
 ```json
 "revisions": [
@@ -250,17 +248,21 @@ pending revision; it does not generate the revised answer:
   {
     "revision_number": 2,
     "feedback": "Make the answer shorter and include the late penalty.",
-    "revision_content": null
+    "revision_content": "Revised draft answer."
   }
 ]
 ```
 
-Call `/generate` next. Keep displaying the latest non-null `revision_content`
-while a new revision is pending. The top-level `citations` list stays unchanged
-during review and can be displayed as the conversation's sources. The feedback belongs to the revision it asks
-the backend to generate, not to the previous entry. The API does not support
-editing feedback, directly submitting an edited answer, or selecting an older
-revision for acceptance.
+Display the returned version immediately. Do not call `/generate` after review;
+that operation now returns `409` once an initial draft exists. Repeat `/review`
+with new feedback for further revisions. Keep the current draft visible and
+retain the input feedback while the request runs. A generation failure or failed
+conditional write leaves the saved version unchanged. After a network timeout,
+GET the session before retrying because the write may already have completed.
+
+The API does not support editing a saved feedback entry, submitting an edited
+answer directly, or accepting an older revision. Existing development sessions
+with pending revisions are not migrated; create new sessions after upgrading.
 
 ### 4. Accept: `POST /reply-sessions/{conversation_id}/accept`
 
@@ -312,18 +314,17 @@ Session errors use `{"detail": "..."}`:
 | `404` | Any operation on an unknown or expired session | `Reply session not found` |
 | `409` | Generate in an invalid state | `Session is not ready for generation` |
 | `409` | Review outside `awaiting_review` | `Session is not awaiting review` |
-| `409` | Accept an unfinished generation/revision | `Session has no pending acceptance` |
+| `409` | Accept before the first draft | `Session has no pending acceptance` |
 | `409` | QA Memory contains a newer accepted revision | `A newer accepted revision already exists in QA Memory` |
 | `409` | Conflicting session write | `Session changed; fetch it before retrying` |
 | `503` | Get | `The service could not retrieve the session` |
-| `503` | Review | `The service could not save the feedback` |
+| `503` | Review | `The service could not revise the reply` |
 | `503` | Create | `The service could not create a session` |
 | `503` | Generate | `The service could not generate a reply` |
 | `503` | Accept | `The service could not accept the reply` |
 
-The revision-helper conflict is a defensive check and is not expected during a
-serialized valid workflow. Do not rely on every exception producing this
-envelope: there is no global custom error handler.
+These are application error responses; an upstream proxy may return another
+format. There is no global custom error handler.
 
 ### Request validation
 
@@ -409,13 +410,11 @@ const generated = await requestJson<ReplySession>(baseUrl, `${sessionPath}/gener
   method: "POST",
 });
 // Display generated.revisions and collect feedback before requesting a revision.
-const reviewed = await requestJson<ReplySession>(baseUrl, `${sessionPath}/review`, {
+const revised = await requestJson<ReplySession>(baseUrl, `${sessionPath}/review`, {
   method: "POST",
   body: { feedback: "Make the answer shorter." },
 });
-const revised = await requestJson<ReplySession>(baseUrl, `${sessionPath}/generate`, {
-  method: "POST",
-});
+// Display revised immediately; another review request creates the next version.
 ```
 
 Handle fetch network/abort exceptions separately from `ApiError`. For a session

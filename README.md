@@ -1,15 +1,14 @@
 # On Course Agent Service
 
-A FastAPI service that generates grounded answers to student questions. It uses
-an LLM to classify each question, retrieves relevant context from the configured
-sources, and generates a draft in a reply session. Every reply supports teacher
-feedback and repeated revision before acceptance for reuse as historical Q&A. Acceptance pins the reviewed
-revision before publishing it and can be resumed after a failure.
+A FastAPI and MCP service that generates student replies from four information
+sources, revises them using teacher feedback, and publishes accepted answers to
+historical Q&A. Cosmos DB is the only application session store. Acceptance pins
+the reviewed revision before publishing it and can resume after a failure.
 
 ## Features
 
-- Intent classification and source selection for student questions
-- General explanations, problem-solving help, and practical guidance without mandatory retrieval
+- Parallel retrieval from four information sources for every initial reply
+- General explanations and practical guidance even when retrieval is empty
 - Course-aware draft generation with citations for retrieved information
 - Hybrid keyword/vector retrieval from Azure AI Search
 - University policy retrieval from configured public web pages
@@ -26,9 +25,10 @@ shared between workers, and expire 30 days after creation.
 
 Ordinary conceptual questions, self-contained exercises, programming help, and
 study advice can use the model's general knowledge without retrieved evidence.
-The intent classifier skips retrieval when the question does not depend on
-course-specific information. Empty or irrelevant search results do not prevent
-a general answer.
+Initial generation searches course materials, university policies, historical
+Q&A, and the Canvas adapter concurrently using the original query. Each source
+has a 30-second execution deadline; unavailable sources are logged and other
+results remain usable. Empty or irrelevant results do not prevent a general answer.
 
 Course-specific details such as deadlines, assessment formats, grading rules,
 and university policies still require supplied course information or explicit
@@ -44,8 +44,9 @@ those IDs to original retrieved `SearchResult` objects, preserving their text,
 URLs, titles, and excerpts. Unknown IDs are ignored and their count is logged;
 they do not block the answer. General-knowledge answers may have empty citations.
 Factual accuracy and whether a selected source supports the answer still rely
-on the generation prompt and teacher review. Initial generation uses one
-classification call and one answer call; a revision uses one answer call.
+on the generation prompt and teacher review. Initial generation and each
+revision use one answer-model call; retrieval and QA publication make separate
+embedding calls.
 
 Source IDs follow the retrieval order and remain stable when that saved snapshot
 is reused. Session revisions reuse a persisted snapshot of the original retrieval and
@@ -54,10 +55,18 @@ drafts and requests to change tone are not evidence. The public API returns the
 session with revision history and a top-level `citations` list. Citations
 accumulate sources actually used across generated replies, deduplicated by
 source type, URL, and source text while preserving their first occurrence.
-Review and answers without new citations retain the accumulated list. New
-sessions and older records without citations return `[]`; legacy per-revision
-citations are merged on read. Internal answer statuses and the complete
-retrieval snapshot are not included.
+Answers without new citations retain the accumulated list. New sessions return
+`[]`. Internal answer statuses and the complete retrieval snapshot are not exposed.
+Each review sends the original question and sources, the latest reply, and the
+feedback history to the model, then saves the completed revision atomically.
+Failed reviews leave the previous version unchanged.
+
+Session IDs are generated locally. Model requests send explicit context with
+`store=False`, without a provider conversation or previous response ID. See the
+[OpenAI conversation-state documentation](https://developers.openai.com/api/docs/guides/conversation-state).
+The development API now generates revisions directly in `/review`; clients must
+stop calling `/generate` after review. Start new development sessions when
+switching from the old pending-revision schema; no legacy migration is included.
 
 ## Prerequisites
 
@@ -70,9 +79,9 @@ retrieval snapshot are not included.
 - For accepted historical Q&A: an Azure Cosmos DB for NoSQL account with vector
   search enabled
 
-Cosmos DB is required for every reply-session operation. Azure AI Search and
-the historical Q&A container are queried when selected by the intent classifier;
-accepted answers are also persisted to historical Q&A.
+Cosmos DB is required for every reply-session operation. Creation requires only
+session storage. Initial generation queries all four source adapters; review
+reuses the saved retrieval. Accepted answers are published to historical Q&A.
 
 ## Setup
 
@@ -89,7 +98,6 @@ automatically when the application starts:
 # LLM and embeddings
 OPENAI_ENDPOINT=https://api.openai.com/v1
 OPENAI_API_KEY=<api-key>
-INTENT_CLASSIFIER_MODEL_NAME=<model-or-deployment-name>
 REPLY_MODEL_NAME=<model-or-deployment-name>
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
@@ -228,8 +236,9 @@ described in [Setup](#setup). Reply sessions are shared with HTTP workers using
 the same Cosmos database and session container and last 30 days from creation.
 
 Tool schemas describe the same sessions and revision feedback as the HTTP API.
-Create a session, generate its draft, then submit feedback and generate again
-as needed. Pass returned conversation IDs unchanged. MCP session tools accept
+Create a session, generate its first draft, then call `request_reply_revision`
+with feedback for each subsequent version. That tool returns the revised answer
+directly; do not call `generate_session_reply` again. Pass returned conversation IDs unchanged. MCP session tools accept
 letters, digits, underscores, and hyphens; URL paths, query strings, and encoded
 URL fragments are rejected before execution.
 
@@ -271,7 +280,7 @@ Events include:
 
 - `mcp.tool.*` and `http.request.*`: tool or route, duration, HTTP status, and
   completion, rejection, timeout, or cancellation outcome.
-- `reply.*`, `retrieval.*`, and `llm.*`: routing decisions, source/result counts,
+- `reply.*`, `retrieval.*`, and `llm.*`: citation warnings, source/result counts,
   model calls, token usage when available, and stage durations. Skipped public
   policy pages produce a warning with their configured page index.
 - `session.transition`: conversation/course ID, previous and next status, and
@@ -343,16 +352,13 @@ curl -X POST \
   http://127.0.0.1:8000/reply-sessions/<conversation_id>/generate
 ```
 
-Request a revision if needed, then call `/generate` again:
+Submit feedback to generate and save a revision in one request:
 
 ```bash
 curl -X POST \
   http://127.0.0.1:8000/reply-sessions/<conversation_id>/review \
   -H 'Content-Type: application/json' \
   -d '{"feedback":"Make the answer shorter and include the late penalty."}'
-
-curl -X POST \
-  http://127.0.0.1:8000/reply-sessions/<conversation_id>/generate
 ```
 
 Accept the final reply and persist it to the course's historical Q&A collection:
@@ -371,13 +377,9 @@ curl http://127.0.0.1:8000/reply-sessions/<conversation_id>
 The expected session progression is:
 
 ```text
-pending_generation -> awaiting_review -> accepted
-                              |
-                              v
-                    revision_requested
-                              |
-                              v
-                       awaiting_review
+pending_generation -- generate --> awaiting_review -- accept --> accepting --> accepted
+                                       |
+                                       +-- review(feedback) --> awaiting_review
 ```
 
 ## Tests
@@ -405,9 +407,9 @@ See [tests/README.md](tests/README.md) for the test boundaries and conventions.
 
 ```text
 main.py                         FastAPI routes and application entry point
-src/agents/                     Intent classification and reply generation
+src/agents/                     Reply generation and source-ID resolution
 src/prompts/                    LLM system prompts
-src/services/                   Embedding and historical Q&A services
+src/services/                   Session workflows, embeddings, and QA publication
 src/repositories/               Persistence access
 src/tools/search.py             Multi-source search orchestration
 src/tools/search_providers/     Azure, website, Cosmos, and Canvas providers
