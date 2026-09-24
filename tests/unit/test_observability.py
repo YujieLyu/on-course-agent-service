@@ -46,9 +46,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mcp_and_api_logs_share_request_id_without_payloads(self):
         private = "private-student-question-do-not-log"
-        with patch("main.reply_sessions", make_session_service()), patch(
-            "main.create_conversation", new=AsyncMock(return_value="conv-logs"),
-        ), self.assertLogs("mcp_server") as mcp_logs, self.assertLogs("src.observability") as api_logs:
+        with patch("main.reply_sessions", make_session_service()), self.assertLogs("mcp_server") as mcp_logs, self.assertLogs("src.observability") as api_logs:
             async with Client(create_mcp_server(app)) as client:
                 await client.call_tool("create_reply_session", {
                     "question": private, "course_id": "course-1", "user_id": "private-user-id",

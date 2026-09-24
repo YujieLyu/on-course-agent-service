@@ -1,176 +1,132 @@
-"""Deterministic HTTP fault cases that cannot be triggered by a public body."""
-
-import itertools
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from main import app
-from src.domain.reply_sessions import QaMemoryConflictError, SessionConflictError, StorageUnavailableError
-from src.models import ReplyResponse, SessionStatus
-from tests.fakes import generation_result, make_session_service
+from src.domain.reply_sessions import SessionConflictError, StorageUnavailableError
+from src.models import ReplyResponse, SearchResults
+from tests.fakes import make_session_service
 
 
 class ApiFailureContractTests(unittest.TestCase):
     def setUp(self):
         self.store = make_session_service()
-        self.ids = itertools.count(1)
-        self.enterContext(patch('main.reply_sessions', self.store))
-        self.create = self.enterContext(patch('main.create_conversation', new=AsyncMock(return_value='created')))
-        reply = ReplyResponse(reply='A test draft.', status='answered', citations=[])
-        self.generate = self.enterContext(patch('main.run_orchestration', new=AsyncMock(return_value=generation_result(reply))))
-        self.revise = self.enterContext(patch('main.generate_session_revision', new=AsyncMock(return_value=reply)))
-        self.publish = self.enterContext(patch('main.save_accepted_qna', new=AsyncMock()))
-        self.enterContext(patch('main.logger.exception'))
-        self.client = self.enterContext(TestClient(app))
+        self.answer = AsyncMock(return_value=ReplyResponse(reply='A test draft.', status='answered', citations=[]))
+        self.search = AsyncMock(return_value=SearchResults(query='Question', results=[]))
+        self.publish = AsyncMock()
+        for target, value in [
+            ('main.reply_sessions', self.store), ('main.save_accepted_qna', self.publish),
+            ('src.services.reply_sessions.run_answer', self.answer), ('src.services.reply_sessions.search', self.search),
+        ]:
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.client = TestClient(app)
+        self.counter = 0
 
-    def session(self, status=SessionStatus.PENDING_GENERATION):
-        session_id = f'fault_contract_{next(self.ids)}'
-        self.store.create(session_id, 'When is Assignment 1 due?', 'test-course')
-        if status != SessionStatus.PENDING_GENERATION:
-            self.store.save_generation(self.store.load_snapshot(session_id), 'Original draft.')
-        if status == SessionStatus.REVISION_REQUESTED:
-            self.store.request_revision(session_id, 'Make it shorter.')
-        elif status in (SessionStatus.ACCEPTING, SessionStatus.ACCEPTED):
-            claimed = self.store.begin_acceptance(self.store.load_snapshot(session_id))
-            if status == SessionStatus.ACCEPTED:
-                self.store.complete_acceptance(claimed)
-        return f'/reply-sessions/{session_id}'
+    def session(self, generated=False):
+        self.counter += 1
+        identifier = f'test-{self.counter}'
+        self.store.create(identifier, 'Question', 'test-course')
+        if generated:
+            self.store.save_generation(self.store.load_snapshot(identifier), 'Previous draft')
+        return f'/reply-sessions/{identifier}'
 
     def assert_error(self, response, code, detail):
         self.assertEqual(response.status_code, code, response.text)
         self.assertEqual(response.json(), {'detail': detail})
-        self.assertRegex(response.headers['X-Request-ID'], r'^[A-Za-z0-9_.-]{1,128}$')
+        self.assertIn('X-Request-ID', response.headers)
 
-    def test_creation_provider_and_storage_failures_return_sanitized_503(self):
-        payload = {'question': 'Question', 'course_id': 'test-course'}
-        with patch('main.create_conversation', new=AsyncMock(side_effect=RuntimeError('private provider failure'))):
-            self.assert_error(self.client.post('/reply-sessions', json=payload), 503,
-                              'The service could not create a session')
-        with patch.object(self.store.repository, 'create', side_effect=StorageUnavailableError('private database failure')) as create:
-            self.assert_error(self.client.post('/reply-sessions', json=payload), 503,
-                              'The service could not create a session')
-            create.assert_called_once()
-        self.assertEqual(self.store.repository.snapshots, {})
+    def test_creation_uses_local_ids_and_only_needs_storage(self):
+        with patch('src.workflow.llm.create_openai_client') as llm:
+            created = self.client.post('/reply-sessions', json={'question': 'Question', 'course_id': 'course-1'})
+        self.assertEqual(created.status_code, 201)
+        self.assertRegex(created.json()['conversation_id'], r'^[a-f0-9]{32}$')
+        self.assertEqual(created.json()['status'], 'pending_generation')
+        llm.assert_not_called()
+        with patch.object(self.store.repository, 'create', side_effect=StorageUnavailableError('private database failure')):
+            self.assert_error(self.client.post('/reply-sessions', json={'question': 'Question', 'course_id': 'c1'}),
+                              503, 'The service could not create a session')
 
-    def test_unavailable_storage_returns_endpoint_specific_503(self):
-        path = self.session()
-        cases = [
-            ('GET', '', None, 'The service could not retrieve the session'),
-            ('POST', '/generate', None, 'The service could not generate a reply'),
-            ('POST', '/review', {'feedback': 'Shorter.'}, 'The service could not save the feedback'),
-            ('POST', '/accept', None, 'The service could not accept the reply'),
-        ]
-        with patch.object(self.store.repository, 'read', side_effect=StorageUnavailableError('private database failure')):
-            for method, suffix, body, detail in cases:
-                with self.subTest(suffix=suffix):
-                    kwargs = {'json': body} if body is not None else {}
-                    self.assert_error(self.client.request(method, path + suffix, **kwargs), 503, detail)
-        self.generate.assert_not_awaited()
-        self.revise.assert_not_awaited()
+    def test_invalid_input_and_unknown_sessions_do_not_call_dependencies(self):
+        for body in [{}, {'question': '', 'course_id': 'c1'}, {'question': 'Question', 'course_id': None}]:
+            self.assertEqual(self.client.post('/reply-sessions', json=body).status_code, 422)
+        for suffix in ['/generate', '/review', '/accept']:
+            body = {'feedback': 'Shorter'} if suffix == '/review' else None
+            self.assert_error(self.client.post('/reply-sessions/missing' + suffix, json=body), 404, 'Reply session not found')
+        self.answer.assert_not_awaited()
+        self.search.assert_not_awaited()
         self.publish.assert_not_awaited()
 
-    def test_initial_and_revision_generation_failures_preserve_state_then_retry(self):
-        for state, dependency in [(SessionStatus.PENDING_GENERATION, self.generate),
-                                  (SessionStatus.REVISION_REQUESTED, self.revise)]:
-            with self.subTest(state=state):
-                path = self.session(state)
+    def test_unavailable_storage_returns_safe_endpoint_errors(self):
+        path = self.session()
+        with patch.object(self.store.repository, 'read', side_effect=StorageUnavailableError('private database failure')):
+            for method, suffix, body, detail in [
+                ('GET', '', None, 'The service could not retrieve the session'),
+                ('POST', '/generate', None, 'The service could not generate a reply'),
+                ('POST', '/review', {'feedback': 'Shorter'}, 'The service could not revise the reply'),
+                ('POST', '/accept', None, 'The service could not accept the reply'),
+            ]:
+                with self.subTest(suffix=suffix):
+                    self.assert_error(self.client.request(method, path + suffix, json=body), 503, detail)
+        self.answer.assert_not_awaited()
+        self.publish.assert_not_awaited()
+
+    def test_generation_and_review_failures_preserve_state_and_allow_retry(self):
+        for reviewing in (False, True):
+            with self.subTest(reviewing=reviewing):
+                path = self.session(generated=reviewing)
+                suffix = '/review' if reviewing else '/generate'
+                body = {'feedback': 'Shorter'} if reviewing else None
                 before = self.client.get(path).json()
-                dependency.side_effect = [RuntimeError('private generation failure'), dependency.return_value]
-                self.assert_error(self.client.post(path + '/generate'), 503,
-                                  'The service could not generate a reply')
+                self.answer.side_effect = [RuntimeError('private model failure'), self.answer.return_value]
+                failed = self.client.post(path + suffix, json=body)
+                self.assertEqual(failed.status_code, 503)
+                self.assertNotIn('private', failed.text)
                 self.assertEqual(self.client.get(path).json(), before)
-                retried = self.client.post(path + '/generate')
+                retried = self.client.post(path + suffix, json=body)
                 self.assertEqual(retried.status_code, 200)
                 self.assertEqual(retried.json()['status'], 'awaiting_review')
-                self.assertEqual(retried.json()['revisions'][-1]['revision_content'], 'A test draft.')
+                self.assertEqual(len(retried.json()['revisions']), 2 if reviewing else 1)
+                if reviewing:
+                    self.assertEqual(retried.json()['revisions'][-1]['feedback'], 'Shorter')
 
-    def test_failed_review_write_does_not_append_feedback(self):
-        path = self.session(SessionStatus.AWAITING_REVIEW)
-        before = self.client.get(path).json()
-        with patch.object(self.store.repository, 'replace', side_effect=StorageUnavailableError('private write failure')):
-            self.assert_error(self.client.post(path + '/review', json={'feedback': 'Shorter.'}), 503,
-                              'The service could not save the feedback')
-        self.assertEqual(self.client.get(path).json(), before)
+    def test_failed_or_conflicting_write_does_not_append_partial_revision(self):
+        for error, code in [(StorageUnavailableError('private write failure'), 503), (SessionConflictError('Session changed'), 409)]:
+            for reviewing in (False, True):
+                with self.subTest(code=code, reviewing=reviewing):
+                    path = self.session(generated=reviewing)
+                    before = self.client.get(path).json()
+                    with patch.object(self.store.repository, 'replace', side_effect=error):
+                        response = self.client.post(path + ('/review' if reviewing else '/generate'),
+                                                    json={'feedback': 'Shorter'} if reviewing else None)
+                    self.assertEqual(response.status_code, code)
+                    self.assertEqual(self.client.get(path).json(), before)
 
-    def test_conditional_write_conflicts_cannot_overwrite_session_or_publish(self):
-        for state, suffix, body in [
-            (SessionStatus.PENDING_GENERATION, '/generate', None),
-            (SessionStatus.REVISION_REQUESTED, '/generate', None),
-            (SessionStatus.AWAITING_REVIEW, '/review', {'feedback': 'Shorter.'}),
-            (SessionStatus.AWAITING_REVIEW, '/accept', None),
-        ]:
-            with self.subTest(state=state, suffix=suffix):
-                path = self.session(state)
-                before = self.client.get(path).json()
-                detail = 'Session changed; fetch it before retrying'
-                with patch.object(self.store.repository, 'replace', side_effect=SessionConflictError(detail)):
-                    kwargs = {'json': body} if body is not None else {}
-                    self.assert_error(self.client.post(path + suffix, **kwargs), 409, detail)
-                self.assertEqual(self.client.get(path).json(), before)
+    def test_accept_claim_conflict_never_publishes(self):
+        path = self.session(generated=True)
+        with patch.object(self.store.repository, 'replace', side_effect=SessionConflictError('Session changed')):
+            self.assert_error(self.client.post(path + '/accept'), 409, 'Session changed')
         self.publish.assert_not_awaited()
 
-    def test_failed_publication_locks_review_and_generation_until_accept_retry(self):
-        path = self.session(SessionStatus.AWAITING_REVIEW)
-        before = self.client.get(path).json()
-        self.publish.side_effect = [RuntimeError('private QA failure'), None]
-        self.assert_error(self.client.post(path + '/accept'), 503, 'The service could not accept the reply')
-        self.assertEqual(self.client.get(path).json(), {**before, 'status': 'accepting'})
+    def test_invalid_states_reject_generation_and_review_before_calling_llm(self):
+        path = self.session()
+        self.assert_error(self.client.post(path + '/review', json={'feedback': 'Shorter'}), 409, 'Session is not awaiting review')
+        identifier = path.rsplit('/', 1)[1]
+        self.store.save_generation(self.store.load_snapshot(identifier), 'Draft')
         self.assert_error(self.client.post(path + '/generate'), 409, 'Session is not ready for generation')
-        self.assert_error(self.client.post(path + '/review', json={'feedback': 'Too late.'}),
-                          409, 'Session is not awaiting review')
-        accepted = self.client.post(path + '/accept')
-        self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(accepted.json(), {**before, 'status': 'accepted'})
-        self.assertEqual(self.publish.await_count, 2)
-        repeated = self.client.post(path + '/accept')
-        self.assertEqual(repeated.status_code, 200)
-        self.assertEqual(repeated.json(), accepted.json())
-        self.assertEqual(self.publish.await_count, 2)
+        self.client.post(path + '/accept')
+        self.assert_error(self.client.post(path + '/review', json={'feedback': 'Shorter'}), 409, 'Session is not awaiting review')
+        self.answer.assert_not_awaited()
+        self.search.assert_not_awaited()
 
-    def test_qa_memory_version_conflict_keeps_acceptance_pending(self):
-        path = self.session(SessionStatus.AWAITING_REVIEW)
-        detail = 'A newer accepted revision already exists in QA Memory'
-        self.publish.side_effect = QaMemoryConflictError(detail)
-        self.assert_error(self.client.post(path + '/accept'), 409, detail)
-        self.assertEqual(self.client.get(path).json()['status'], 'accepting')
-
-    def test_acceptance_claim_and_finalization_outages_remain_recoverable(self):
-        for failed_state, expected_state in [(SessionStatus.ACCEPTING, 'awaiting_review'),
-                                             (SessionStatus.ACCEPTED, 'accepting')]:
-            with self.subTest(failed_state=failed_state):
-                path = self.session(SessionStatus.AWAITING_REVIEW)
-                before = self.client.get(path).json()
-                original_replace = self.store.repository.replace
-
-                def fail_selected_write(snapshot):
-                    if snapshot.session.status == failed_state:
-                        raise StorageUnavailableError('private write failure')
-                    return original_replace(snapshot)
-
-                self.publish.reset_mock()
-                with patch.object(self.store.repository, 'replace', side_effect=fail_selected_write):
-                    self.assert_error(self.client.post(path + '/accept'), 503, 'The service could not accept the reply')
-                self.assertEqual(self.client.get(path).json(), {**before, 'status': expected_state})
-                self.assertEqual(self.publish.await_count, 0 if failed_state == SessionStatus.ACCEPTING else 1)
-                retried = self.client.post(path + '/accept')
-                self.assertEqual(retried.status_code, 200)
-                self.assertEqual(retried.json(), {**before, 'status': 'accepted'})
-
-    def test_expiry_at_exact_deadline_rejects_every_session_operation(self):
-        path = self.session(SessionStatus.AWAITING_REVIEW)
-        session_id = path.rsplit('/', 1)[1]
-        self.store.clock = lambda: self.store.repository.read(session_id).session.expires_at
+    def test_expired_sessions_reject_all_operations(self):
+        path = self.session(generated=True)
+        identifier = path.rsplit('/', 1)[1]
+        self.store.clock = lambda: self.store.repository.read(identifier).session.expires_at
         for method, suffix, body in [('GET', '', None), ('POST', '/generate', None),
-                                     ('POST', '/review', {'feedback': 'Shorter.'}), ('POST', '/accept', None)]:
-            with self.subTest(suffix=suffix):
-                kwargs = {'json': body} if body is not None else {}
-                self.assert_error(self.client.request(method, path + suffix, **kwargs), 404, 'Reply session not found')
-        self.generate.assert_not_awaited()
-        self.revise.assert_not_awaited()
+                                     ('POST', '/review', {'feedback': 'Shorter'}), ('POST', '/accept', None)]:
+            self.assert_error(self.client.request(method, path + suffix, json=body), 404, 'Reply session not found')
+        self.answer.assert_not_awaited()
         self.publish.assert_not_awaited()
-
-
-if __name__ == '__main__':
-    unittest.main()

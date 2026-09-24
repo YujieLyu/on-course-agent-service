@@ -19,7 +19,7 @@ def main() -> None:
                 "includedPaths": [{"path": "/*"}],
                 "excludedPaths": [
                     {"path": '/"_etag"/?'}, {"path": "/revisions/*"},
-                    {"path": "/retrieved_context/*"}, {"path": "/intent_context/*"},
+                    {"path": "/retrieved_context/*"},
                 ],
             },
         )

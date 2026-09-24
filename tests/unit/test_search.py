@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -38,11 +39,7 @@ class AzureSearchHybridSearchTests(unittest.IsolatedAsyncioTestCase):
             "_get_settings",
             return_value=search_settings,
         ):
-            result = await search(
-                "How does this course work?",
-                [SearchSource.COURSE_MATERIALS],
-                "course-1",
-            )
+            result = await azure_ai_search.search("How does this course work?", "course-1")
 
         self.assertIsInstance(result, SearchResults)
         self.assertEqual(result.query, "How does this course work?")
@@ -50,11 +47,6 @@ class AzureSearchHybridSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result.results[0], SearchResult)
         self.assertEqual(result.results[0].source, SearchSource.COURSE_MATERIALS)
         self.assertEqual(result.results[0].content, "Course overview")
-
-    async def test_unknown_source_returns_empty_results(self):
-        result = await search("question", ["unsupported"], "course-1")
-
-        self.assertEqual(result, SearchResults(query="question", results=[]))
 
     async def test_uses_sdk_semantic_configuration_argument(self):
         search_client = unittest.mock.MagicMock()
@@ -89,41 +81,47 @@ class AzureSearchHybridSearchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("semantic_config_name", kwargs)
 
-    async def test_combines_each_selected_source_once(self):
-        course_result = SearchResult(
-            source=SearchSource.COURSE_MATERIALS,
-            content="Course content",
-        )
-        policy_result = SearchResult(
-            source=SearchSource.UNIVERSITY_POLICIES,
-            content="Policy content",
-        )
 
-        with patch(
-            "src.tools.search_providers.azure_ai_search.search",
-            new=AsyncMock(
-                return_value=SearchResults(query="question", results=[course_result])
-            ),
-        ) as course_search, patch(
-            "src.tools.search_providers.public_website_search.search",
-            new=AsyncMock(
-                return_value=SearchResults(query="question", results=[policy_result])
-            ),
-        ) as policy_search:
-            result = await search(
-                "question",
-                [
-                    SearchSource.COURSE_MATERIALS,
-                    SearchSource.UNIVERSITY_POLICIES,
-                    SearchSource.COURSE_MATERIALS,
-                ],
-                "course-1",
-            )
+class FourSourceSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_four_sources_run_concurrently_in_stable_order(self):
+        entered = set()
+        all_entered = asyncio.Event()
+        async def provider(source, query, course_id):
+            self.assertEqual((query, course_id), ("question", "course-1"))
+            entered.add(source)
+            if len(entered) == 4:
+                all_entered.set()
+            await asyncio.wait_for(all_entered.wait(), 1)
+            return SearchResults(query=query, results=[SearchResult(source=source, content=source)])
+        methods = {
+            source: AsyncMock()
+            for source in SearchSource
+        }
+        for source, mock in methods.items():
+            async def run(query, course_id, source=source):
+                return await provider(source, query, course_id)
+            mock.side_effect = run
+        with patch("src.tools.search._SEARCH_METHODS", methods):
+            result = await search("question", "course-1")
+        self.assertEqual([item.source for item in result.results], list(SearchSource))
+        for method in methods.values():
+            method.assert_awaited_once_with("question", "course-1")
 
-        self.assertEqual(result.results, [course_result, policy_result])
-        course_search.assert_awaited_once_with("question", "course-1")
-        policy_search.assert_awaited_once_with("question", "course-1")
+    async def test_source_failure_and_timeout_preserve_other_results(self):
+        async def stalled(*args):
+            await asyncio.Event().wait()
+        source = SearchResult(source=SearchSource.COURSE_MATERIALS, content="Submit a PDF.")
+        methods = {
+            SearchSource.COURSE_MATERIALS: AsyncMock(return_value=SearchResults(query="question", results=[source])),
+            SearchSource.UNIVERSITY_POLICIES: AsyncMock(side_effect=RuntimeError("Unavailable")),
+            SearchSource.CANVAS: stalled,
+            SearchSource.HISTORICAL_QNA: AsyncMock(return_value=SearchResults(query="question", results=[])),
+        }
+        with patch("src.tools.search._SEARCH_METHODS", methods), patch("src.tools.search.SOURCE_TIMEOUT_SECONDS", 0.01):
+            result = await search("question", "course-1")
+        self.assertEqual(result.results, [source])
 
-
-if __name__ == "__main__":
-    unittest.main()
+    async def test_cancellation_is_not_treated_as_empty_retrieval(self):
+        methods = {SearchSource.COURSE_MATERIALS: AsyncMock(side_effect=asyncio.CancelledError())}
+        with patch("src.tools.search._SEARCH_METHODS", methods), self.assertRaises(asyncio.CancelledError):
+            await search("question", "course-1")

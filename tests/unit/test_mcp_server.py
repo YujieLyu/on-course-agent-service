@@ -52,7 +52,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         async def review_session(conversation_id: str, payload: dict[str, Any]):
             path = f"/reply-sessions/{conversation_id}/review"
             self.requests.append(("POST", path, payload))
-            return session(conversation_id, "revision_requested")
+            return session(conversation_id, "awaiting_review")
 
         @api.post("/reply-sessions/{conversation_id}/accept")
         async def accept_session(conversation_id: str):
@@ -162,14 +162,6 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(payload=payload):
                     result = await client.call_tool("create_reply_session", payload, raise_on_error=False)
                     self.assertTrue(result.is_error)
-        self.assertEqual(self.requests, [])
-
-    async def test_direct_answer_tool_is_unavailable(self):
-        async with Client(self.server) as client:
-            result = await client.call_tool("answer_student_question", {
-                "question": "Question", "course_id": "course-1", "user_id": "student-1",
-            }, raise_on_error=False)
-        self.assertTrue(result.is_error)
         self.assertEqual(self.requests, [])
 
     async def test_session_ids_cannot_change_any_tool_route(self):

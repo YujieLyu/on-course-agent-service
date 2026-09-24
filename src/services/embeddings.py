@@ -1,14 +1,13 @@
 import os
 
 from src.logger import get_logger, log_operation
-from src.models import ClientType
-from src.workflow.llm import create_llm_client
+from src.workflow.llm import create_openai_client
 
 logger = get_logger(__name__)
 
 
 async def generate_embedding(text: str, model: str | None = None) -> list[float]:
-    client = create_llm_client(ClientType.OPENAI)
+    client = create_openai_client()
     embedding_model = (
         model
         or os.getenv("AZURE_EMBEDDING_MODEL_DEPLOYMENT_NAME")

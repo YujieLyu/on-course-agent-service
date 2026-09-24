@@ -1,10 +1,9 @@
 from datetime import datetime
-from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.domain.evidence import IntentClassification, SearchResult, SearchSource, StudentIntent
+from src.domain.evidence import SearchResult, SearchSource
 from src.domain.reply_sessions import Revision, SessionStatus
 
 
@@ -14,29 +13,9 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ClientType(StrEnum):
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
-
-
 class SearchResults(StrictModel):
     query: str = Field(min_length=1)
     results: list[SearchResult]
-
-
-class ChatMessage(StrictModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1)
-    created_at: datetime | None = None
-
-
-class ReplyRequest(StrictModel):
-    """Internal input for initial reply orchestration; not an HTTP request model."""
-
-    question: str = Field(min_length=1)
-    user_id: str
-    course_id: str
-    chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
 ReplyStatus = Literal["answered", "needs_clarification", "not_found", "escalated", "error"]
@@ -64,14 +43,6 @@ class HTTPErrorResponse(StrictModel):
     """Error body returned by HTTPException for reply-session operations."""
 
     detail: str
-
-
-class ReplyGeneration(StrictModel):
-    """An answer and the evidence to persist atomically with its first revision."""
-
-    response: ReplyResponse
-    intent: IntentClassification
-    retrieved_context: list[SearchResult]
 
 
 class ReplySession(StrictModel):

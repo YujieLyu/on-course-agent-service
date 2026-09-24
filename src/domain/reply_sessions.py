@@ -8,7 +8,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.domain.evidence import IntentClassification, SearchResult, merge_citations
+from src.domain.evidence import SearchResult, merge_citations
 from src.domain.retention import SESSION_RETENTION
 
 
@@ -48,7 +48,6 @@ class AcceptedReply(BaseModel):
 class SessionStatus(StrEnum):
     PENDING_GENERATION = "pending_generation"
     AWAITING_REVIEW = "awaiting_review"
-    REVISION_REQUESTED = "revision_requested"
     ACCEPTING = "accepting"
     ACCEPTED = "accepted"
 
@@ -58,7 +57,7 @@ class Revision(BaseModel):
 
     revision_number: int = Field(ge=1)
     feedback: str | None = None
-    revision_content: str | None = None
+    revision_content: str
 
 
 class ReplySession(BaseModel):
@@ -75,7 +74,6 @@ class ReplySession(BaseModel):
     status: SessionStatus = SessionStatus.PENDING_GENERATION
     revisions: tuple[Revision, ...] = ()
     citations: tuple[SearchResult, ...] = ()
-    intent_context: IntentClassification | None = None
     retrieved_context: tuple[SearchResult, ...] = ()
     acceptance: AcceptedReply | None = None
 
@@ -96,40 +94,40 @@ class ReplySession(BaseModel):
             raise SessionNotFoundError(self.conversation_id)
         return remaining
 
-    def generation_is_revision(self, now: datetime) -> bool:
+    def require_generation(self, now: datetime) -> None:
         self._require_status(
-            now, (SessionStatus.PENDING_GENERATION, SessionStatus.REVISION_REQUESTED),
+            now, (SessionStatus.PENDING_GENERATION,),
             "Session is not ready for generation",
         )
-        return self.status == SessionStatus.REVISION_REQUESTED
 
-    def request_revision(self, feedback: str, now: datetime) -> "ReplySession":
+    def require_review(self, now: datetime) -> None:
         self._require_status(now, (SessionStatus.AWAITING_REVIEW,), "Session is not awaiting review")
-        revision = Revision(revision_number=len(self.revisions) + 1, feedback=feedback)
-        return self.model_copy(update={
-            "status": SessionStatus.REVISION_REQUESTED,
-            "revisions": (*self.revisions, revision),
-        })
 
     def record_generation(
         self, content: str, now: datetime, *,
         citations: Iterable[SearchResult] = (),
-        evidence: tuple[IntentClassification, list[SearchResult]] | None = None,
+        retrieved_context: Iterable[SearchResult] = (),
     ) -> "ReplySession":
-        if self.generation_is_revision(now):
-            revision = self.revisions[-1].model_copy(update={"revision_content": content})
-            return self.model_copy(update={
-                "status": SessionStatus.AWAITING_REVIEW,
-                "revisions": (*self.revisions[:-1], revision),
-                "citations": merge_citations(self.citations, citations),
-            })
-        intent, results = evidence if evidence is not None else (None, ())
+        self.require_generation(now)
         return self.model_copy(update={
             "status": SessionStatus.AWAITING_REVIEW,
             "revisions": (Revision(revision_number=1, revision_content=content),),
             "citations": merge_citations(self.citations, citations),
-            "intent_context": intent,
-            "retrieved_context": tuple(results),
+            "retrieved_context": tuple(retrieved_context),
+        })
+
+    def record_revision(
+        self, feedback: str, content: str, now: datetime, *,
+        citations: Iterable[SearchResult] = (),
+    ) -> "ReplySession":
+        self.require_review(now)
+        revision = Revision(
+            revision_number=len(self.revisions) + 1,
+            feedback=feedback, revision_content=content,
+        )
+        return self.model_copy(update={
+            "revisions": (*self.revisions, revision),
+            "citations": merge_citations(self.citations, citations),
         })
 
     def begin_acceptance(self, now: datetime) -> "ReplySession":

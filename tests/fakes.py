@@ -7,7 +7,7 @@ from threading import Lock
 from azure.core import MatchConditions
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 
-from src.models import IntentClassification, ReplyGeneration, ReplyResponse, StudentIntent, SessionStatus
+from src.models import SessionStatus
 from src.domain.reply_sessions import SessionConflictError, SessionNotFoundError, SessionSnapshot
 from src.domain.retention import utc_now
 from src.repositories.reply_sessions import CosmosReplySessionRepository
@@ -97,13 +97,3 @@ class InMemorySessionRepository:
 def make_session_service(container: FakeSessionContainer | None = None, *, clock=utc_now) -> ReplySessionService:
     repository = CosmosReplySessionRepository(container, clock=clock) if container is not None else InMemorySessionRepository()
     return ReplySessionService(repository, clock=clock)
-
-
-def generation_result(response: ReplyResponse) -> ReplyGeneration:
-    return ReplyGeneration(
-        response=response,
-        intent=IntentClassification(
-            intent=StudentIntent.OUT_OF_SCOPE, search_sources=[], needs_clarification=False,
-        ),
-        retrieved_context=[],
-    )

@@ -10,7 +10,6 @@ from azure.cosmos import ContainerProxy, CosmosClient
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 
 from src.config import REPLY_SESSION_RETENTION_SECONDS, load_cosmos_session_settings
-from src.domain.evidence import SearchResult, merge_citations
 from src.domain.reply_sessions import (
     Clock, ReplySession, SessionConflictError, SessionNotFoundError, SessionSnapshot,
     StorageUnavailableError,
@@ -111,15 +110,6 @@ class CosmosReplySessionRepository:
     @staticmethod
     def _snapshot(document: dict[str, Any]) -> SessionSnapshot:
         data = {key: document[key] for key in ReplySession.model_fields if key in document}
-        # Read both legacy per-revision citations and the current session-level layout.
-        # Only the next normal write persists the converted layout.
-        citations = list(data.get("citations", []))
-        revisions = []
-        for revision in data.get("revisions", []):
-            citations.extend(revision.get("citations", []))
-            revisions.append({key: value for key, value in revision.items() if key != "citations"})
-        data["revisions"] = revisions
-        data["citations"] = merge_citations(SearchResult.model_validate(item) for item in citations)
         return SessionSnapshot(
             session=ReplySession.model_validate(data),
             version=document["_etag"],

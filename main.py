@@ -1,19 +1,17 @@
 import asyncio
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 
-from src.agents.orchestrator import generate_session_revision, run_orchestration
 from src.logger import get_logger
 from src.observability import RequestLoggingMiddleware
 from src.models import (
     CreateReplySessionRequest,
     HTTPErrorResponse,
-    ReplyRequest,
     ReplySession as ReplySessionResponse,
     ReviewReplySessionRequest,
 )
 from src.bootstrap import create_session_service, save_accepted_qna
 from src.services.reply_acceptance import accept_reply
-from src.workflow.llm import create_conversation
 from src.domain.reply_sessions import (
     InvalidSessionActionError,
     QaMemoryConflictError,
@@ -65,7 +63,7 @@ def check_health() -> str:
 )
 async def create_reply_session(request: CreateReplySessionRequest) -> ReplySessionResponse:
     try:
-        conversation_id = await create_conversation()
+        conversation_id = uuid4().hex
         session = await asyncio.to_thread(
             reply_sessions.create, conversation_id, request.question,
             request.course_id,
@@ -105,10 +103,9 @@ def get_reply_session(conversation_id: str) -> ReplySessionResponse:
 @app.post(
     "/reply-sessions/{conversation_id}/generate",
     tags=["Reply Sessions"],
-    summary="Generate or revise a session reply",
+    summary="Generate the initial session reply",
     description=(
-        "Generate the first draft for a pending_generation session, or revise a draft for a "
-        "revision_requested session using teacher feedback and existing evidence. "
+        "Search all four sources and generate the first draft for a pending_generation session. "
         "The updated session enters awaiting_review. No request body is required."
     ),
     operation_id="generate_session_reply",
@@ -116,33 +113,13 @@ def get_reply_session(conversation_id: str) -> ReplySessionResponse:
     responses={
         404: {"model": HTTPErrorResponse, "description": "Reply session not found."},
         409: {"model": HTTPErrorResponse, "description": "The session is not ready for generation."},
-        503: {"model": HTTPErrorResponse, "description": "The reply could not be generated or checked."},
+        503: {"model": HTTPErrorResponse, "description": "The reply could not be generated."},
     },
 )
 async def generate_session_reply(conversation_id: str) -> ReplySessionResponse:
     try:
-        snapshot = await asyncio.to_thread(reply_sessions.load_snapshot, conversation_id)
-        session = snapshot.session
-        evidence = None
-        if session.generation_is_revision(reply_sessions.clock()):
-            response = await generate_session_revision(session)
-        else:
-            generation = await run_orchestration(
-                ReplyRequest(
-                    question=session.student_query,
-                    user_id=session.user_id or conversation_id,
-                    course_id=session.course_id,
-                ),
-                session_context=ReplySessionResponse.model_validate(session).model_dump_json(),
-                conversation_id=conversation_id,
-            )
-            response = generation.response
-            evidence = (generation.intent, generation.retrieved_context)
-        saved = await asyncio.to_thread(
-            reply_sessions.save_generation, snapshot, response.reply,
-            citations=response.citations, evidence=evidence,
-        )
-        return ReplySessionResponse.model_validate(saved)
+        session = await reply_sessions.generate(conversation_id)
+        return ReplySessionResponse.model_validate(session)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
     except InvalidSessionActionError as error:
@@ -158,31 +135,33 @@ async def generate_session_reply(conversation_id: str) -> ReplySessionResponse:
 @app.post(
     "/reply-sessions/{conversation_id}/review",
     tags=["Reply Sessions"],
-    summary="Request a reply revision",
+    summary="Revise a reply using teacher feedback",
     description=(
-        "Record teacher feedback for an awaiting_review session and move it to revision_requested. "
-        "Call the generate operation to produce the revised draft."
+        "Generate a revision using teacher feedback and the saved retrieval. "
+        "Save feedback and the completed reply together, returning an awaiting_review session. "
+        "A failed review leaves the previous version unchanged."
     ),
     operation_id="review_reply_session",
     response_model=ReplySessionResponse,
     responses={
         404: {"model": HTTPErrorResponse, "description": "Reply session not found."},
         409: {"model": HTTPErrorResponse, "description": "The session is not awaiting review."},
-        503: {"model": HTTPErrorResponse, "description": "The feedback could not be saved."},
+        503: {"model": HTTPErrorResponse, "description": "The reply could not be revised."},
     },
 )
-def review_reply_session(
+async def review_reply_session(
     conversation_id: str, request: ReviewReplySessionRequest
 ) -> ReplySessionResponse:
     try:
-        return ReplySessionResponse.model_validate(reply_sessions.request_revision(conversation_id, request.feedback))
+        session = await reply_sessions.review(conversation_id, request.feedback)
+        return ReplySessionResponse.model_validate(session)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Reply session not found")
     except InvalidSessionActionError as error:
         raise HTTPException(status_code=409, detail=str(error))
     except Exception:
-        logger.exception("Failed to save reply session feedback")
-        raise HTTPException(status_code=503, detail="The service could not save the feedback")
+        logger.exception("Failed to revise reply session")
+        raise HTTPException(status_code=503, detail="The service could not revise the reply")
 
 
 @app.post(

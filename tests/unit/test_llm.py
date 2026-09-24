@@ -2,50 +2,27 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx
-from openai import NotFoundError
-
-from src.workflow.llm import create_conversation, supports_provider_conversation
+from src.models import ReplyDraft
+from src.workflow.llm import parse_structured_response, request_structured_output
 
 
-class ConversationFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_uses_local_id_when_endpoint_has_no_conversations_api(self):
-        request = httpx.Request("POST", "https://openai.example.test/conversations")
-        response = httpx.Response(404, request=request)
-        client = SimpleNamespace(
-            conversations=SimpleNamespace(
-                create=AsyncMock(
-                    side_effect=NotFoundError(
-                        "Resource not found",
-                        response=response,
-                        body=None,
-                    )
-                )
-            )
-        )
+class StructuredResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stateless_call_returns_validated_output(self):
+        draft = ReplyDraft(reply='A reply', status='answered', cited_source_ids=[])
+        response = SimpleNamespace(output=[], output_parsed=draft, output_text='')
+        client = SimpleNamespace(responses=SimpleNamespace(parse=AsyncMock(return_value=response)))
+        with patch('src.workflow.llm.create_openai_client', return_value=client):
+            result = await request_structured_output(model='test-model', instructions='Answer', input='Question', output_type=ReplyDraft)
+        self.assertEqual(result, draft)
+        arguments = client.responses.parse.await_args.kwargs
+        self.assertFalse(arguments['store'])
+        self.assertNotIn('conversation', arguments)
+        self.assertNotIn('previous_response_id', arguments)
 
-        with patch("src.workflow.llm.create_openai_client", return_value=client), patch(
-            "src.workflow.llm.logger.warning"
-        ) as warning:
-            conversation_id = await create_conversation()
-
-        self.assertTrue(conversation_id.startswith("local_"))
-        self.assertFalse(supports_provider_conversation(conversation_id))
-        warning.assert_called_once()
-
-    async def test_keeps_provider_conversation_when_supported(self):
-        client = SimpleNamespace(
-            conversations=SimpleNamespace(
-                create=AsyncMock(return_value=SimpleNamespace(id="conv_1"))
-            )
-        )
-
-        with patch("src.workflow.llm.create_openai_client", return_value=client):
-            conversation_id = await create_conversation()
-
-        self.assertEqual(conversation_id, "conv_1")
-        self.assertTrue(supports_provider_conversation(conversation_id))
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_refusals_and_missing_structured_output_are_errors(self):
+        for response in [
+            SimpleNamespace(output=[SimpleNamespace(type='message', content=[SimpleNamespace(type='refusal', refusal='Refused')])]),
+            SimpleNamespace(output=[], output_parsed=None, output_text='Malformed output'),
+        ]:
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                parse_structured_response(response, ReplyDraft)

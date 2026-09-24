@@ -146,8 +146,9 @@ class OnCourseApi:
 
 SERVER_INSTRUCTIONS = (
     "Answer every student question through a revisable reply session. "
-    "Create a session, generate a reply, then either "
-    "request a revision and generate again, or accept the final reply after "
+    "Create a session and generate its first reply. Each request_reply_revision call "
+    "generates and saves a revised reply directly; do not call generate_session_reply after review. "
+    "Repeat review as needed, or accept the final reply after "
     "explicit teacher approval. Acceptance persists historical course Q&A. "
     "Use known course/user IDs and preserve returned conversation IDs. "
     "After a timeout, get the session status before retrying a write. "
@@ -201,7 +202,7 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
         annotations={"readOnlyHint": False, "destructiveHint": False},
     )
     async def generate_session_reply(conversation_id: ConversationId) -> ReplySessionResponse:
-        """Generate the initial reply or the requested session revision."""
+        """Search all four sources and generate the initial reply."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/generate",
@@ -215,7 +216,7 @@ def create_mcp_server(api_app: FastAPI = app, *, timeout_seconds: float | None =
         conversation_id: ConversationId,
         feedback: NonEmptyString,
     ) -> ReplySessionResponse:
-        """Request another reply revision using teacher feedback."""
+        """Generate and save a revised reply using teacher feedback; no generate call follows."""
         return await api.call(
             "POST",
             f"/reply-sessions/{conversation_id}/review",

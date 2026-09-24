@@ -116,8 +116,7 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(accept_reply('conv-1', self.store, publish))
             try:
                 self.assertTrue(await asyncio.to_thread(entered.wait, 5))
-                self.store.request_revision('conv-1', 'Replace the draft')
-                self.store.save_generation(self.store.load_snapshot('conv-1'), 'New reviewed draft')
+                self.store.save_revision(self.store.load_snapshot('conv-1'), 'Replace the draft', 'New reviewed draft')
             finally:
                 release.set()
             with self.assertRaises(SessionConflictError):
@@ -139,7 +138,7 @@ class AcceptanceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(entered.wait(), 5)
             snapshot = self.store.load_snapshot('conv-1')
             with self.assertRaises(InvalidSessionActionError):
-                self.store.request_revision('conv-1', 'Change it')
+                self.store.save_revision(snapshot, 'Change it', 'Changed draft')
             with self.assertRaises(InvalidSessionActionError):
                 self.store.save_generation(snapshot, 'Unapproved draft')
             fast_result = await accept_reply('conv-1', self.store, self.publisher.publish)

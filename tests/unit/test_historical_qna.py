@@ -8,7 +8,7 @@ from src.models import SearchSource
 from src.repositories import historical_qna as historical_qna_repository
 from src.repositories.historical_qna import CosmosQaMemoryRepository
 from src.services.historical_qna import HistoricalQnaPublisher
-from src.tools.search import search
+from src.tools.search_providers.historical_qna_search import search
 from tests.fakes import FakeSessionContainer
 
 
@@ -63,7 +63,7 @@ class HistoricalQnaTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(historical_qna_repository, "load_cosmos_qna_settings", return_value={"top_k": 3}), patch.object(
             historical_qna_repository, "_get_container", return_value=container,
         ):
-            result = await search("deadline", [SearchSource.HISTORICAL_QNA], "course-1")
+            result = await search("deadline", "course-1")
         self.assertEqual(container.query_items.call_args.kwargs["partition_key"], "course-1")
         self.assertEqual(result.results[0].source, SearchSource.HISTORICAL_QNA)
         self.assertIn("Friday.", result.results[0].content)
