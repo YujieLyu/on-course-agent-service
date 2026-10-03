@@ -14,3 +14,13 @@ wheels/
 # Raw and not-yet-human-reviewed evaluation data
 eval/SMNA-sent-matched.csv
 eval/processed/
+
+# Local Codex configuration and agent instructions
+.codex/
+.agents/
+AGENTS.md
+
+# Local refactor execution records; keep design and task ledgers
+/docs/refactor/*/*
+!/docs/refactor/*/ARCHITECTURE.md
+!/docs/refactor/*/TASKS.md
