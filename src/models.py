@@ -1,10 +1,9 @@
 from datetime import datetime
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.domain.evidence import SearchResult, SearchSource
-from src.domain.reply_sessions import Revision, SessionStatus
+from src.domain.reply_sessions import ReplyStatus, SessionStatus
 
 
 class StrictModel(BaseModel):
@@ -16,9 +15,6 @@ class StrictModel(BaseModel):
 class SearchResults(StrictModel):
     query: str = Field(min_length=1)
     results: list[SearchResult]
-
-
-ReplyStatus = Literal["answered", "needs_clarification", "not_found", "escalated", "error"]
 
 
 class ReplyDraft(StrictModel):
@@ -45,7 +41,20 @@ class HTTPErrorResponse(StrictModel):
     detail: str
 
 
-class ReplySession(StrictModel):
+class RevisionResponse(StrictModel):
+    """Public version metadata; full evidence stays in the session repository."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    revision_number: int = Field(ge=1, description="Together with conversation_id, identifies this revision.")
+    feedback: str | None = None
+    revision_content: str
+    outcome: ReplyStatus | None = Field(default=None, description="Actual generation result; null for unknown legacy outcomes.")
+    citations: list[SearchResult] | None = Field(default=None, description="Sources cited by this version; [] means none, null means unknown legacy provenance.")
+    completed_at: datetime | None = Field(default=None, description="Time the completed revision was recorded; null when not recorded by a legacy writer.")
+
+
+class ReplySessionResponse(StrictModel):
     """Public response DTO; domain state and persistence metadata stay internal."""
 
     model_config = ConfigDict(from_attributes=True)
@@ -55,9 +64,11 @@ class ReplySession(StrictModel):
     user_id: str | None = None
     student_query: str = Field(min_length=1)
     status: SessionStatus = SessionStatus.PENDING_GENERATION
-    revisions: list[Revision] = Field(default_factory=list)
-    citations: list[SearchResult] = Field(
-        default_factory=list, description="Deduplicated sources cited across all generated replies in this session."
+    revisions: list[RevisionResponse] = Field(default_factory=list)
+    citations: list[SearchResult] | None = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("current_citations", "citations"),
+        description="Sources cited by the current revision; [] means none, null means unknown legacy provenance.",
     )
     created_at: datetime
     expires_at: datetime

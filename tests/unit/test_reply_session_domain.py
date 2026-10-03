@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pydantic import ValidationError
 
 from src.domain.reply_sessions import InvalidSessionActionError, ReplySession, SessionNotFoundError
-from src.models import ReplySession as ReplySessionResponse, SearchResult
+from src.models import ReplySessionResponse, SearchResult
 
 
 class ReplySessionDomainTests(unittest.TestCase):
@@ -13,13 +13,20 @@ class ReplySessionDomainTests(unittest.TestCase):
         self.pending = ReplySession.create('session-1', 'Question', 'course-1', now=self.now)
         self.source = SearchResult(source='course_materials', content='Submit a PDF.')
 
-    def test_completed_revisions_accumulate_sources_and_preserve_original_context(self):
-        first = self.pending.record_generation('Submit a PDF.', self.now, citations=[self.source], retrieved_context=[self.source])
+    def test_completed_revisions_keep_their_own_sources_and_preserve_evidence(self):
+        first = self.pending.record_generation('Submit a PDF.', self.now, citations=[self.source], retrieved_context=[self.source], outcome='answered')
         other = SearchResult(source='university_policies', content='Declare AI use.')
         second = first.record_revision('Include the policy', 'Submit a PDF and declare AI use.', self.now, citations=[self.source, other])
         third = second.record_revision('Shorter', 'PDF; declare AI use.', self.now)
         self.assertEqual([revision.revision_number for revision in third.revisions], [1, 2, 3])
-        self.assertEqual(third.citations, (self.source, other))
+        self.assertEqual(third.citations, ())
+        self.assertEqual(third.current_citations, ())
+        self.assertEqual(first.revisions[0].citations, (self.source,))
+        self.assertEqual(second.revisions[-1].citations, (self.source, other))
+        self.assertEqual(third.revisions[-1].citations, ())
+        self.assertEqual(first.revisions[0].outcome, 'answered')
+        self.assertEqual(third.revisions[-1].evidence, (self.source,))
+        self.assertEqual(third.revisions[-1].completed_at, self.now)
         self.assertEqual(third.retrieved_context, (self.source,))
         self.assertEqual(third.status, 'awaiting_review')
         self.assertEqual(third.expires_at, self.now + timedelta(days=30))
@@ -52,8 +59,12 @@ class ReplySessionDomainTests(unittest.TestCase):
         response = ReplySessionResponse.model_validate(draft.begin_acceptance(self.now))
         self.assertNotIn('retrieved_context', response.model_dump())
         self.assertNotIn('acceptance', response.model_dump())
+        self.assertNotIn('evidence', response.model_dump()['revisions'][0])
+        self.assertEqual(response.revisions[0].citations, [self.source])
         response.citations.clear()
+        response.revisions[0].citations.clear()
         self.assertEqual(draft.citations, (self.source,))
+        self.assertEqual(draft.revisions[0].citations, (self.source,))
         with self.assertRaises(ValidationError):
             ReplySessionResponse.model_validate({'conversation_id': '1', 'course_id': 'c1', 'student_query': 'Question'})
 

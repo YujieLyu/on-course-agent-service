@@ -15,11 +15,36 @@ from mcp.client.stdio import stdio_client
 from main import app
 from mcp_server import create_mcp_server
 from src.models import ReplyDraft, SearchResult, SearchResults, SearchSource
-from tests.fakes import make_session_service
+from tests.fakes import FakeSessionContainer, make_session_service
 from tests.integration.test_reply_flow import TEST_ENV, fake_llm_client
 
 
 class McpFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_after_restart_returns_each_revision_outcome_and_citations(self):
+        container = FakeSessionContainer()
+        source = SearchResult(source='course_materials', content='Original course evidence')
+        drafts = [
+            ReplyDraft(reply='Supported answer', status='answered', cited_source_ids=['source_1']),
+            ReplyDraft(reply='Which assignment?', status='needs_clarification', cited_source_ids=[]),
+        ]
+        with patch('main.reply_sessions', make_session_service(container)), patch(
+            'src.services.reply_sessions.search', new=AsyncMock(return_value=SearchResults(query='Question', results=[source])),
+        ), patch('src.agents.reply_agent.request_structured_output', new=AsyncMock(side_effect=drafts)):
+            async with Client(create_mcp_server(app)) as client:
+                created = await client.call_tool('create_reply_session', {'question': 'Question', 'course_id': 'course-1'})
+                args = {'conversation_id': created.structured_content['conversation_id']}
+                await client.call_tool('generate_session_reply', args)
+                await client.call_tool('request_reply_revision', {**args, 'feedback': 'Which assignment?'})
+                with patch('main.reply_sessions', make_session_service(container)):
+                    restored = (await client.call_tool('get_reply_session', args)).structured_content
+        self.assertEqual(restored['citations'], [])
+        self.assertEqual([revision['outcome'] for revision in restored['revisions']], ['answered', 'needs_clarification'])
+        self.assertEqual([revision['citations'] for revision in restored['revisions']], [[source.model_dump(mode='json')], []])
+        for revision in restored['revisions']:
+            self.assertIsNotNone(revision['completed_at'])
+            self.assertNotIn('evidence', revision)
+        self.assertNotIn('retrieved_context', restored)
+
     async def test_complete_workflow_through_api_and_external_boundaries(self):
         initial = ReplyDraft(reply="Initial answer", status="answered", cited_source_ids=[])
         revision = ReplyDraft(reply="Revised answer", status="answered", cited_source_ids=[])
@@ -80,7 +105,10 @@ class McpFlowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(session["status"], "awaiting_review")
                     self.assertEqual(session["revisions"][-1]["revision_content"], answer.reply)
                     self.assertEqual(session["citations"], [citation.model_dump(mode="json")])
-                    self.assertNotIn("citations", session["revisions"][-1])
+                    self.assertEqual(session["revisions"][-1]["citations"], session["citations"])
+                    self.assertEqual(session["revisions"][-1]["outcome"], 'answered')
+                    self.assertIsNotNone(session["revisions"][-1]["completed_at"])
+                    self.assertNotIn('evidence', session['revisions'][-1])
 
     async def test_stdio_process_keeps_protocol_and_logs_separate(self):
         root = Path(__file__).resolve().parents[2]

@@ -32,31 +32,43 @@ configuration error rather than silently bypassing the retention policy.
 
 Each session is one document with `id` equal to `conversation_id`. The partition
 key is `/id`, allowing point reads using the ID already present in the HTTP URL.
-Draft text, accumulated citations, and original retrieval evidence are written
-together in one document. The public session exposes a top-level `citations`
-list containing sources actually used across generated replies; the full
-retrieval snapshot remains internal. Repeated source type, URL, and content
-combinations are deduplicated, preserving the first entry. Review and uncited
-answers retain earlier citations. Revisions contain only their number,
-feedback, and draft text. This container has no vector index.
+Each embedded revision saves its number, feedback, draft text, actual generation
+`outcome`, full `evidence` snapshot, actual `citations` and `completed_at` in the
+same conditional document write. Revision identity is the pair of session ID
+and revision number. Completion time is the time the finished revision is
+recorded, not the start of an external model call. This container has no vector index.
+
+The public revision excludes the full evidence snapshot. Its citations identify
+only the sources that version used. Top-level `citations` mirrors the latest
+revision and is no longer cumulative. Repeated source type, URL and content
+combinations are deduplicated within each version. An uncited new answer has
+`citations: []`, regardless of earlier versions' citations.
 
 Generation assigns source IDs such as `source_1` using the order of the original
 retrieval results. The model returns selected IDs, which the answer agent resolves
 to original `SearchResult` objects before the draft and citations are saved.
-Revisions rebuild the same mapping from the persisted `retrieved_context` order,
-including after a restart; the cumulative citations list does not determine IDs.
+Revisions rebuild the same mapping from the latest revision's persisted evidence
+order, including after a restart; citations do not determine source IDs.
 IDs require no additional document fields. Unknown IDs are ignored and counted
 in logs without rejecting the draft. Existing citations are not revalidated.
 
 Sessions use locally generated UUIDs; no provider conversation is created or
 continued. Model calls receive explicit context with `store=False`. The original
-retrieval is stored once. Each review reads the latest version, generates from
+retrieval is retained at session level for legacy compatibility; each new revision
+also records the evidence it used. Each review reads the latest version, generates from
 saved sources plus feedback history, and appends a completed revision in one
 conditional write. There is no persisted pending-review state. Failed generation
 leaves both the feedback history and previous answer unchanged.
 
-This development schema does not migrate old pending revisions or per-revision
-citations. Create new sessions when switching to the one-request review API.
+Existing completed revisions remain readable through nullable metadata defaults.
+Missing legacy outcomes, evidence, citations and completion times stay `null`;
+they are not reconstructed from accumulated session citations or session creation
+time. An empty evidence snapshot (`[]`) is known empty and never triggers fallback.
+When a legacy revision has unknown evidence, a new review uses the original
+session retrieval and records that snapshot on the new revision only. Historical
+text and feedback are preserved. GET makes no data writes; no mass migration is
+required. Legacy top-level accumulated citations may remain in storage but are
+not exposed as the current revision's citations.
 
 `created_at` and `expires_at` are UTC timestamps. Expiry is fixed at creation plus
 30 days. Each write sets the item TTL to the remaining lifetime because Cosmos
@@ -138,9 +150,10 @@ records are not silently overwritten or repaired by the recovery job.
   for both session creation and conditional replacement, including the write-time
   expiry check and successful-transition logging. It never reloads a snapshot
   during commit or retries a conflicting business operation.
-- `src/models.py`: the public `ReplySession` response DTO retains the established
-  API schema name and projects only public fields. HTTP handlers explicitly
-  convert aggregates to this DTO; the full retrieval snapshot, acceptance payloads, and
+- `src/models.py`: public `ReplySessionResponse` and `RevisionResponse` DTOs
+  project only public fields and use those names in OpenAPI. The domain aggregate
+  and revision retain `ReplySession` and `Revision`. HTTP handlers explicitly
+  convert aggregates to response DTOs; the full retrieval snapshot, acceptance payloads, and
   storage versions are excluded. The DTO requires persisted timestamps instead
   of inventing them during response validation.
 - `src/agents/reply_agent.py`: one structured model call with explicit question,
@@ -178,5 +191,7 @@ uncertain write before resubmitting. Disable competing mutations while a request
 is running. Cosmos ETags also reject overlapping writes from different clients.
 
 Only completed revisions are durable. Manual answer edits and unsubmitted notes
-are not saved. Clients can display the top-level cumulative citations alongside
-the conversation, and explicitly accept the latest answer for QA publication.
+are not saved. Clients can display each revision's own citations and outcome;
+top-level citations describe the latest version. Show unknown provenance for
+legacy `null` values rather than claiming there were no sources. Explicitly
+accept the latest answer for QA publication.

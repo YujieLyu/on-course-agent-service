@@ -98,13 +98,18 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(first.json()['citations'], [item.model_dump(mode='json') for item in sources[:2]])
         restarted = make_session_service(self.container)
         with patch('main.reply_sessions', restarted):
-            for feedback, draft in zip(['Mention the portal.', 'Make it shorter.'], drafts[1:]):
+            for feedback, draft, cited in zip(['Mention the portal.', 'Make it shorter.'], drafts[1:], [[sources[2], sources[0]], []]):
                 revised = self.client.post(path + '/review', json={'feedback': feedback})
                 self.assertEqual(revised.status_code, 200)
                 self.assertEqual(revised.json()['status'], 'awaiting_review')
                 self.assertEqual(revised.json()['revisions'][-1]['revision_content'], draft.reply)
                 self.assertEqual(revised.json()['revisions'][-1]['feedback'], feedback)
-                self.assertEqual(revised.json()['citations'], [item.model_dump(mode='json') for item in sources])
+                self.assertEqual(revised.json()['citations'], [item.model_dump(mode='json') for item in cited])
+                current_revision = revised.json()['revisions'][-1]
+                self.assertEqual(current_revision['citations'], revised.json()['citations'])
+                self.assertEqual(current_revision['outcome'], draft.status)
+                self.assertIsNotNone(current_revision['completed_at'])
+                self.assertNotIn('evidence', current_revision)
             accepted = self.client.post(path + '/accept')
             self.assertEqual(accepted.status_code, 200)
             self.assertEqual(accepted.json()['status'], 'accepted')
@@ -128,6 +133,29 @@ class ReplyFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(final_input['feedback_history'], ['Mention the portal.', 'Make it shorter.'])
         self.assertNotIn('retrieved_context', accepted.json())
         self.assertNotIn('cited_source_ids', accepted.json())
+
+    def test_get_legacy_revisions_reports_unknown_metadata_without_rewriting(self):
+        path = self.create()
+        identifier = path.rsplit('/', 1)[-1]
+        document = self.container.documents[identifier]
+        document.update({
+            'status': 'awaiting_review',
+            'revisions': [{'revision_number': 1, 'feedback': 'Teacher note', 'revision_content': 'Legacy draft'}],
+            'citations': [{'source': 'course_materials', 'content': 'Legacy cumulative source'}],
+            'retrieved_context': [{'source': 'course_materials', 'content': 'Private unused evidence'}],
+        })
+        with patch('main.reply_sessions', make_session_service(self.container)):
+            response = self.client.get(path)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()['citations'])
+        revision = response.json()['revisions'][0]
+        self.assertEqual(revision['revision_content'], 'Legacy draft')
+        self.assertEqual(revision['feedback'], 'Teacher note')
+        for field in ['outcome', 'citations', 'completed_at']:
+            self.assertIsNone(revision[field])
+        self.assertNotIn('evidence', revision)
+        self.assertNotIn('Private unused evidence', response.text)
+        self.assertNotIn('completed_at', self.container.documents[identifier]['revisions'][0])
 
     def test_empty_retrieval_still_returns_a_general_answer(self):
         self.course_search.search.return_value = []

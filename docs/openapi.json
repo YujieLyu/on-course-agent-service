@@ -59,7 +59,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReplySession"
+                  "$ref": "#/components/schemas/ReplySessionResponse"
                 }
               }
             }
@@ -112,7 +112,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReplySession"
+                  "$ref": "#/components/schemas/ReplySessionResponse"
                 }
               }
             }
@@ -175,7 +175,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReplySession"
+                  "$ref": "#/components/schemas/ReplySessionResponse"
                 }
               }
             }
@@ -258,7 +258,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReplySession"
+                  "$ref": "#/components/schemas/ReplySessionResponse"
                 }
               }
             }
@@ -331,7 +331,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ReplySession"
+                  "$ref": "#/components/schemas/ReplySessionResponse"
                 }
               }
             }
@@ -442,7 +442,7 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
-      "ReplySession": {
+      "ReplySessionResponse": {
         "properties": {
           "conversation_id": {
             "type": "string",
@@ -475,18 +475,25 @@
           },
           "revisions": {
             "items": {
-              "$ref": "#/components/schemas/Revision"
+              "$ref": "#/components/schemas/RevisionResponse"
             },
             "type": "array",
             "title": "Revisions"
           },
           "citations": {
-            "items": {
-              "$ref": "#/components/schemas/SearchResult"
-            },
-            "type": "array",
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SearchResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Citations",
-            "description": "Deduplicated sources cited across all generated replies in this session."
+            "description": "Sources cited by the current revision; [] means none, null means unknown legacy provenance."
           },
           "created_at": {
             "type": "string",
@@ -508,7 +515,7 @@
           "created_at",
           "expires_at"
         ],
-        "title": "ReplySession",
+        "title": "ReplySessionResponse",
         "description": "Public response DTO; domain state and persistence metadata stay internal."
       },
       "ReviewReplySessionRequest": {
@@ -526,12 +533,13 @@
         ],
         "title": "ReviewReplySessionRequest"
       },
-      "Revision": {
+      "RevisionResponse": {
         "properties": {
           "revision_number": {
             "type": "integer",
             "minimum": 1.0,
-            "title": "Revision Number"
+            "title": "Revision Number",
+            "description": "Together with conversation_id, identifies this revision."
           },
           "feedback": {
             "anyOf": [
@@ -547,6 +555,53 @@
           "revision_content": {
             "type": "string",
             "title": "Revision Content"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "answered",
+                  "needs_clarification",
+                  "not_found",
+                  "escalated",
+                  "error"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome",
+            "description": "Actual generation result; null for unknown legacy outcomes."
+          },
+          "citations": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SearchResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Citations",
+            "description": "Sources cited by this version; [] means none, null means unknown legacy provenance."
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At",
+            "description": "Time the completed revision was recorded; null when not recorded by a legacy writer."
           }
         },
         "additionalProperties": false,
@@ -555,7 +610,8 @@
           "revision_number",
           "revision_content"
         ],
-        "title": "Revision"
+        "title": "RevisionResponse",
+        "description": "Public version metadata; full evidence stays in the session repository."
       },
       "SearchResult": {
         "properties": {

@@ -2,7 +2,7 @@
 
 This contract describes the implemented HTTP API in `main.py`, the wire models
 in `src/models.py`, the rules in `src/domain/reply_sessions.py`, and the application
-operations in `src/services/reply_sessions.py` as of 2026-09-22.
+operations in `src/services/reply_sessions.py`, including TASK-001 revision provenance.
 It describes current behavior, including integration limitations;
 it does not propose additional endpoints.
 
@@ -55,11 +55,11 @@ it when building paths. Do not assume a UUID or a particular prefix.
 | Method | Path | Request body | Success | Known errors |
 | --- | --- | --- | --- | --- |
 | GET | `/health` | None | `200`, JSON string | — |
-| POST | `/reply-sessions` | `CreateReplySessionRequest` | `201`, `ReplySession` | `422`, `503` |
-| GET | `/reply-sessions/{conversation_id}` | None | `200`, `ReplySession` | `404`, `503` |
-| POST | `/reply-sessions/{conversation_id}/generate` | None | `200`, `ReplySession` | `404`, `409`, `503` |
-| POST | `/reply-sessions/{conversation_id}/review` | `ReviewReplySessionRequest` | `200`, `ReplySession` | `404`, `409`, `422`, `503` |
-| POST | `/reply-sessions/{conversation_id}/accept` | None | `200`, `ReplySession` | `404`, `409`, `503` |
+| POST | `/reply-sessions` | `CreateReplySessionRequest` | `201`, `ReplySessionResponse` | `422`, `503` |
+| GET | `/reply-sessions/{conversation_id}` | None | `200`, `ReplySessionResponse` | `404`, `503` |
+| POST | `/reply-sessions/{conversation_id}/generate` | None | `200`, `ReplySessionResponse` | `404`, `409`, `503` |
+| POST | `/reply-sessions/{conversation_id}/review` | `ReviewReplySessionRequest` | `200`, `ReplySessionResponse` | `404`, `409`, `422`, `503` |
+| POST | `/reply-sessions/{conversation_id}/accept` | None | `200`, `ReplySessionResponse` | `404`, `409`, `503` |
 
 For endpoints with no body, omit the body. Infrastructure failures can also
 produce other HTTP statuses or non-JSON responses.
@@ -95,20 +95,23 @@ export interface SearchResult {
   excerpt: string | null;
 }
 
-export interface Revision {
-  revision_number: number; // Integer >= 1.
+export interface RevisionResponse {
+  revision_number: number; // Integer >= 1; identity with conversation_id.
   feedback: string | null;
   revision_content: string;
+  outcome: "answered" | "needs_clarification" | "not_found" | "escalated" | "error" | null;
+  citations: SearchResult[] | null; // This version only; null means legacy unknown.
+  completed_at: string | null; // Recorded completion time; null means legacy unknown.
 }
 
-export interface ReplySession {
+export interface ReplySessionResponse {
   conversation_id: string;
   course_id: string;
   user_id: string | null;
   student_query: string; // The question submitted during creation.
   status: SessionStatus;
-  revisions: Revision[]; // Ordered oldest to newest.
-  citations: SearchResult[]; // Deduplicated sources used across all generated replies.
+  revisions: RevisionResponse[]; // Ordered oldest to newest.
+  citations: SearchResult[] | null; // Latest revision only; null means legacy unknown.
   created_at: string; // UTC ISO 8601 timestamp.
   expires_at: string; // Fixed at 30 days after creation.
 }
@@ -190,7 +193,18 @@ full session with `status: "awaiting_review"` and:
     {
       "revision_number": 1,
       "feedback": null,
-      "revision_content": "Submit a PDF report."
+      "revision_content": "Submit a PDF report.",
+      "outcome": "answered",
+      "citations": [
+        {
+          "source": "course_materials",
+          "content": "Assignment One requires a PDF report.",
+          "title": "Assignment One",
+          "source_url": null,
+          "excerpt": null
+        }
+      ],
+      "completed_at": "2026-09-19T00:01:00Z"
     }
   ],
   "citations": [
@@ -211,23 +225,32 @@ call. Canvas currently returns no results. Each source has a 30-second deadline;
 failed sources are logged and omitted without discarding available results.
 Use `/review` for subsequent versions.
 
-The new revision text and updated session citations are saved atomically.
-`citations` is a cumulative list of sources actually used across generated
-answers, not the complete retrieval snapshot or a mapping to individual
-versions. Entries with the same `source`, `source_url`, and `content` are merged,
-preserving the first entry and its metadata. Different passages from the same
-URL remain separate. An answer with no new citations retains the existing list.
-New sessions return `[]`. Citations are stored only at the session level.
+Each completed revision saves its text, actual model outcome, full evidence
+snapshot, actual citations and `completed_at` together. Its identity is the pair
+`conversation_id` and `revision_number`. The public revision includes outcome,
+citations and completion time, while the full evidence snapshot stays internal.
+Top-level `citations` mirrors the latest revision; it is no longer cumulative.
+Entries with the same `source`, `source_url`, and `content` are deduplicated
+within that version, preserving their first occurrence. Different passages from
+the same URL remain separate. An uncited answer returns `[]`, even when an
+earlier version cited sources. New pending sessions also return `[]`.
+
+Legacy revisions retain their saved text and feedback. Missing `outcome`,
+`citations` and `completed_at` return `null`; unknown provenance is not inferred
+from accumulated session citations. Top-level `citations` is also `null` when
+the latest revision's citations are unknown. Clients must distinguish unknown
+(`null`) from a known empty citation set (`[]`). GET does not rewrite old records.
 
 For newly generated answers, citation objects come from the original retrieved
 sources. The model selects internal source IDs; the service resolves them to
 the original source text and metadata. Unknown IDs are ignored without rejecting
 the answer. These IDs and the model's `cited_source_ids` field are not public
-response fields. Existing stored citations are retained as recorded.
+response fields. Earlier revisions' own citations remain as recorded.
 
-The answer-level `status` remains internal. `awaiting_review` does not imply the
-answer was classified as `answered`. Generate, review, GET, and accept continue
-to return the same `ReplySession` model, including top-level citations.
+The answer-level `status` is saved and exposed as each revision's `outcome`;
+session `status` describes the workflow. `awaiting_review` does not imply an
+`answered` outcome. Generate, review, GET, and accept return the same
+`ReplySessionResponse` model. Acceptance eligibility is unchanged in this task.
 
 ### 3. Request changes: `POST /reply-sessions/{conversation_id}/review`
 
@@ -238,19 +261,35 @@ Requires `awaiting_review`. Request:
 ```
 
 Returns the full session with `status: "awaiting_review"` and a completed
-revision. The request reuses the saved original sources, latest answer, and
+revision. The request reuses the latest revision's saved evidence, latest answer, and
 feedback history; it does not search again. Feedback and the generated answer
-are saved together with updated citations using one conditional write.
+are saved together with the new version's outcome, evidence, citations and
+completion time using one conditional write. For legacy revisions without an
+evidence snapshot, the original session retrieval is used as a fallback; this
+does not fill in the missing provenance of historical revisions.
 
 ```json
-"revisions": [
-  {"revision_number": 1, "feedback": null, "revision_content": "Initial draft answer."},
-  {
-    "revision_number": 2,
-    "feedback": "Make the answer shorter and include the late penalty.",
-    "revision_content": "Revised draft answer."
-  }
-]
+{
+  "revisions": [
+    {
+      "revision_number": 1,
+      "feedback": null,
+      "revision_content": "Initial general answer.",
+      "outcome": "answered",
+      "citations": [],
+      "completed_at": "2026-09-19T00:01:00Z"
+    },
+    {
+      "revision_number": 2,
+      "feedback": "Make the answer shorter and include the late penalty.",
+      "revision_content": "Which course assignment's late penalty do you mean?",
+      "outcome": "needs_clarification",
+      "citations": [],
+      "completed_at": "2026-09-19T00:02:00Z"
+    }
+  ],
+  "citations": []
+}
 ```
 
 Display the returned version immediately. Do not call `/generate` after review;
@@ -261,8 +300,9 @@ conditional write leaves the saved version unchanged. After a network timeout,
 GET the session before retrying because the write may already have completed.
 
 The API does not support editing a saved feedback entry, submitting an edited
-answer directly, or accepting an older revision. Existing development sessions
-with pending revisions are not migrated; create new sessions after upgrading.
+answer directly, or accepting an older revision. Existing completed revisions
+remain readable without a data migration. Pending-operation recovery remains
+outside the current implementation.
 
 ### 4. Accept: `POST /reply-sessions/{conversation_id}/accept`
 
@@ -401,16 +441,16 @@ export async function requestJson<T>(
 
 // The base URL may instead be a same-origin proxy prefix configured by the app.
 const baseUrl = "http://127.0.0.1:8000";
-const created = await requestJson<ReplySession>(baseUrl, "/reply-sessions", {
+const created = await requestJson<ReplySessionResponse>(baseUrl, "/reply-sessions", {
   method: "POST",
   body: { question: "What is due this week?", course_id: "c1" },
 });
 const sessionPath = `/reply-sessions/${encodeURIComponent(created.conversation_id)}`;
-const generated = await requestJson<ReplySession>(baseUrl, `${sessionPath}/generate`, {
+const generated = await requestJson<ReplySessionResponse>(baseUrl, `${sessionPath}/generate`, {
   method: "POST",
 });
 // Display generated.revisions and collect feedback before requesting a revision.
-const revised = await requestJson<ReplySession>(baseUrl, `${sessionPath}/review`, {
+const revised = await requestJson<ReplySessionResponse>(baseUrl, `${sessionPath}/review`, {
   method: "POST",
   body: { feedback: "Make the answer shorter." },
 });

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from src.agents.reply_agent import run_answer
 from src.config import get_model_name
 from src.domain.evidence import SearchResult
-from src.domain.reply_sessions import Clock, ReplySession, SessionRepository, SessionSnapshot
+from src.domain.reply_sessions import Clock, ReplySession, ReplyStatus, SessionRepository, SessionSnapshot
 from src.domain.retention import utc_now
 from src.logger import get_logger
 from src.tools.search import search
@@ -43,7 +43,7 @@ class ReplySessionService:
         response = await run_answer(session.student_query, get_model_name("REPLY_MODEL_NAME"), evidence)
         return await asyncio.to_thread(
             self.save_generation, snapshot, response.reply,
-            citations=response.citations, retrieved_context=evidence,
+            citations=response.citations, retrieved_context=evidence, outcome=response.status,
         )
 
     async def review(self, conversation_id: str, feedback: str) -> ReplySession:
@@ -51,29 +51,35 @@ class ReplySessionService:
         session = snapshot.session
         session.require_review(self.clock())
         response = await run_answer(
-            session.student_query, get_model_name("REPLY_MODEL_NAME"), session.retrieved_context,
+            session.student_query, get_model_name("REPLY_MODEL_NAME"), session.revision_context,
             previous_reply=session.revisions[-1].revision_content,
             feedback_history=[revision.feedback for revision in session.revisions if revision.feedback] + [feedback],
         )
         return await asyncio.to_thread(
-            self.save_revision, snapshot, feedback, response.reply, citations=response.citations,
+            self.save_revision, snapshot, feedback, response.reply,
+            citations=response.citations, outcome=response.status,
         )
 
     def save_generation(
         self, snapshot: SessionSnapshot, content: str, *,
         citations: Iterable[SearchResult] = (),
         retrieved_context: Iterable[SearchResult] = (),
+        outcome: ReplyStatus | None = None,
     ) -> ReplySession:
         candidate = snapshot.session.record_generation(
             content, self.clock(), citations=citations, retrieved_context=retrieved_context,
+            outcome=outcome,
         )
         return self._commit(snapshot, candidate).session
 
     def save_revision(
         self, snapshot: SessionSnapshot, feedback: str, content: str, *,
         citations: Iterable[SearchResult] = (),
+        outcome: ReplyStatus | None = None,
     ) -> ReplySession:
-        candidate = snapshot.session.record_revision(feedback, content, self.clock(), citations=citations)
+        candidate = snapshot.session.record_revision(
+            feedback, content, self.clock(), citations=citations, outcome=outcome,
+        )
         return self._commit(snapshot, candidate).session
 
     def begin_acceptance(self, snapshot: SessionSnapshot) -> SessionSnapshot:

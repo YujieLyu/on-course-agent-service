@@ -109,6 +109,8 @@ class CosmosReplySessionRepository:
 
     @staticmethod
     def _snapshot(document: dict[str, Any]) -> SessionSnapshot:
+        # Revision defaults mark missing legacy metadata as unknown. Do not infer
+        # per-version citations from the old cumulative session-level collection.
         data = {key: document[key] for key in ReplySession.model_fields if key in document}
         return SessionSnapshot(
             session=ReplySession.model_validate(data),

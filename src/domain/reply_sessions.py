@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -52,12 +52,21 @@ class SessionStatus(StrEnum):
     ACCEPTED = "accepted"
 
 
+ReplyStatus = Literal["answered", "needs_clarification", "not_found", "escalated", "error"]
+
+
 class Revision(BaseModel):
+    """Identity is (conversation_id, revision_number); null metadata is unknown."""
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     revision_number: int = Field(ge=1)
     feedback: str | None = None
     revision_content: str
+    outcome: ReplyStatus | None = None
+    evidence: tuple[SearchResult, ...] | None = None
+    citations: tuple[SearchResult, ...] | None = None
+    completed_at: datetime | None = None
 
 
 class ReplySession(BaseModel):
@@ -76,6 +85,19 @@ class ReplySession(BaseModel):
     citations: tuple[SearchResult, ...] = ()
     retrieved_context: tuple[SearchResult, ...] = ()
     acceptance: AcceptedReply | None = None
+
+    @property
+    def current_citations(self) -> tuple[SearchResult, ...] | None:
+        # Legacy session citations accumulated across versions, so cannot certify
+        # which sources the last revision actually used.
+        return self.revisions[-1].citations if self.revisions else ()
+
+    @property
+    def revision_context(self) -> tuple[SearchResult, ...]:
+        if self.revisions and self.revisions[-1].evidence is not None:
+            return self.revisions[-1].evidence
+        # Legacy records do preserve original retrieval, but not per-version use.
+        return self.retrieved_context
 
     @classmethod
     def create(
@@ -107,27 +129,36 @@ class ReplySession(BaseModel):
         self, content: str, now: datetime, *,
         citations: Iterable[SearchResult] = (),
         retrieved_context: Iterable[SearchResult] = (),
+        outcome: ReplyStatus | None = None,
     ) -> "ReplySession":
         self.require_generation(now)
+        evidence = tuple(retrieved_context)
+        revision = Revision(
+            revision_number=1, revision_content=content, outcome=outcome,
+            evidence=evidence, citations=merge_citations(citations), completed_at=now,
+        )
         return self.model_copy(update={
             "status": SessionStatus.AWAITING_REVIEW,
-            "revisions": (Revision(revision_number=1, revision_content=content),),
-            "citations": merge_citations(self.citations, citations),
-            "retrieved_context": tuple(retrieved_context),
+            "revisions": (revision,),
+            "citations": revision.citations,
+            "retrieved_context": evidence,
         })
 
     def record_revision(
         self, feedback: str, content: str, now: datetime, *,
         citations: Iterable[SearchResult] = (),
+        outcome: ReplyStatus | None = None,
     ) -> "ReplySession":
         self.require_review(now)
         revision = Revision(
             revision_number=len(self.revisions) + 1,
             feedback=feedback, revision_content=content,
+            outcome=outcome, evidence=self.revision_context,
+            citations=merge_citations(citations), completed_at=now,
         )
         return self.model_copy(update={
             "revisions": (*self.revisions, revision),
-            "citations": merge_citations(self.citations, citations),
+            "citations": revision.citations,
         })
 
     def begin_acceptance(self, now: datetime) -> "ReplySession":

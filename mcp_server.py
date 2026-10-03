@@ -21,7 +21,7 @@ from main import app
 from src.logger import get_log_context, get_logger, log_context, log_operation
 from src.models import (
     CreateReplySessionRequest,
-    ReplySession as ReplySessionResponse,
+    ReplySessionResponse,
     ReviewReplySessionRequest,
 )
 

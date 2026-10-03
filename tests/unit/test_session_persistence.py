@@ -8,7 +8,7 @@ from azure.cosmos.exceptions import CosmosHttpResponseError
 from scripts import provision_cosmos_sessions
 from src.config import REPLY_SESSION_RETENTION_SECONDS, load_cosmos_session_settings
 from src.domain.reply_sessions import SessionConflictError, SessionNotFoundError, StorageUnavailableError
-from src.models import ReplyResponse, SearchResult, SearchResults
+from src.models import ReplyResponse, ReplySessionResponse, SearchResult, SearchResults
 from src.repositories.reply_sessions import validate_session_container
 from tests.fakes import FakeSessionContainer, make_session_service
 
@@ -22,19 +22,73 @@ class DurableSessionTests(unittest.IsolatedAsyncioTestCase):
         self.source = SearchResult(source='course_materials', content='Submit a PDF.')
 
     async def test_restart_restores_revisions_sources_and_fixed_expiry(self):
-        self.store.save_generation(self.store.load_snapshot('session-1'), 'Submit a PDF.',
-                                   citations=[self.source], retrieved_context=[self.source])
+        with patch('src.services.reply_sessions.search', new=AsyncMock(return_value=SearchResults(query='Question', results=[self.source]))), patch(
+            'src.services.reply_sessions.run_answer', new=AsyncMock(return_value=ReplyResponse(reply='Submit a PDF.', status='answered', citations=[self.source])),
+        ):
+            await self.store.generate('session-1')
         restarted = make_session_service(self.container, clock=lambda: self.now)
         self.now += timedelta(days=1)
-        revised = restarted.save_revision(restarted.load_snapshot('session-1'), 'Shorter', 'PDF.', citations=[self.source])
+        with patch('src.services.reply_sessions.search', new=AsyncMock()) as search, patch(
+            'src.services.reply_sessions.run_answer', new=AsyncMock(return_value=ReplyResponse(reply='Which assignment?', status='needs_clarification', citations=[])),
+        ) as answer:
+            revised = await restarted.review('session-1', 'Which assignment?')
+            search.assert_not_awaited()
+            self.assertEqual(answer.await_args.args[2], (self.source,))
         restored = self.store.get('session-1')
         self.assertEqual(restored, revised)
         self.assertEqual(restored.retrieved_context, (self.source,))
-        self.assertEqual(restored.citations, (self.source,))
-        self.assertEqual(restored.revisions[-1].feedback, 'Shorter')
+        self.assertEqual(restored.citations, ())
+        self.assertEqual([revision.outcome for revision in restored.revisions], ['answered', 'needs_clarification'])
+        self.assertEqual([revision.citations for revision in restored.revisions], [(self.source,), ()])
+        self.assertEqual([revision.evidence for revision in restored.revisions], [(self.source,), (self.source,)])
+        self.assertEqual([revision.completed_at for revision in restored.revisions], [self.created.created_at, self.now])
+        self.assertEqual([revision.revision_number for revision in restored.revisions], [1, 2])
+        self.assertEqual(restored.revisions[-1].feedback, 'Which assignment?')
         self.assertEqual(restored.expires_at, self.created.expires_at)
         self.assertEqual(self.container.documents['session-1']['ttl'], 29 * 86400)
         self.assertNotIn('intent_context', self.container.documents['session-1'])
+
+    async def test_legacy_reader_keeps_unknown_provenance_and_review_uses_saved_context(self):
+        document = self.container.documents['session-1']
+        document.update({
+            'status': 'awaiting_review',
+            'revisions': [
+                {'revision_number': 1, 'feedback': None, 'revision_content': 'Original'},
+                {'revision_number': 2, 'feedback': 'Shorter', 'revision_content': 'Short'},
+            ],
+            'citations': [self.source.model_dump(mode='json')],
+            'retrieved_context': [self.source.model_dump(mode='json')],
+        })
+        restarted = make_session_service(self.container, clock=lambda: self.now)
+        restored = restarted.get('session-1')
+        public = ReplySessionResponse.model_validate(restored)
+        self.assertIsNone(public.citations)
+        self.assertEqual([revision.revision_content for revision in restored.revisions], ['Original', 'Short'])
+        for revision in restored.revisions:
+            self.assertIsNone(revision.outcome)
+            self.assertIsNone(revision.evidence)
+            self.assertIsNone(revision.citations)
+            self.assertIsNone(revision.completed_at)
+        with patch('src.services.reply_sessions.run_answer', new=AsyncMock(return_value=ReplyResponse(reply='Information unavailable', status='not_found', citations=[]))) as answer:
+            revised = await restarted.review('session-1', 'What else?')
+        self.assertEqual(answer.await_args.args[2], (self.source,))
+        self.assertEqual(answer.await_args.kwargs['feedback_history'], ['Shorter', 'What else?'])
+        self.assertEqual(revised.revisions[:2], restored.revisions)
+        self.assertEqual(revised.revisions[-1].evidence, (self.source,))
+        self.assertEqual(revised.revisions[-1].outcome, 'not_found')
+        self.assertEqual(revised.current_citations, ())
+        self.assertIsNone(restarted.get('session-1').revisions[0].evidence)
+
+    async def test_empty_snapshot_is_known_and_does_not_fall_back_to_session_context(self):
+        self.store.save_generation(self.store.load_snapshot('session-1'), 'General answer', outcome='answered')
+        self.container.documents['session-1']['retrieved_context'] = [self.source.model_dump(mode='json')]
+        restarted = make_session_service(self.container, clock=lambda: self.now)
+        restored = restarted.get('session-1')
+        self.assertEqual(restored.revisions[0].evidence, ())
+        with patch('src.services.reply_sessions.run_answer', new=AsyncMock(return_value=ReplyResponse(reply='General revision', status='answered', citations=[]))) as answer:
+            revised = await restarted.review('session-1', 'Shorter')
+        self.assertEqual(answer.await_args.args[2], ())
+        self.assertEqual(revised.revisions[-1].evidence, ())
 
     async def test_generation_and_review_each_use_one_read_and_one_atomic_write_off_loop(self):
         loop_thread = threading.get_ident()

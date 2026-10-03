@@ -7,7 +7,7 @@ from src.observability import RequestLoggingMiddleware
 from src.models import (
     CreateReplySessionRequest,
     HTTPErrorResponse,
-    ReplySession as ReplySessionResponse,
+    ReplySessionResponse,
     ReviewReplySessionRequest,
 )
 from src.bootstrap import create_session_service, save_accepted_qna

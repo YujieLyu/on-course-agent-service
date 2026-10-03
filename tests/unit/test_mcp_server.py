@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastmcp import Client
 
 from mcp_server import create_mcp_server
-from src.models import ReplySession
+from src.models import ReplySessionResponse
 from tests.fakes import make_session_service
 
 
@@ -19,7 +19,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
         self.api = api
 
         def session(conversation_id: str, status: str) -> dict[str, Any]:
-            return ReplySession(
+            return ReplySessionResponse(
                 conversation_id=conversation_id,
                 course_id="course-1",
                 student_query="When is the assignment due?",
@@ -202,7 +202,7 @@ class McpServerTests(unittest.IsolatedAsyncioTestCase):
 
         @api.get("/reply-sessions/{conversation_id}")
         async def get_session(conversation_id: str):
-            return ReplySession(
+            return ReplySessionResponse(
                 conversation_id=conversation_id, course_id="c1", student_query="Question",
                 created_at=datetime(2026, 9, 1, tzinfo=UTC),
                 expires_at=datetime(2026, 10, 1, tzinfo=UTC),

@@ -6,12 +6,13 @@ credentials, network access, or paid API capacity.
 
 - `integration`: HTTP runs real retrieval adapters and answer generation with
   fake OpenAI, search, website, and Cosmos clients. It verifies a workflow across
-  a service restart, stable source IDs, cumulative citations, and acceptance of
+  a service restart, stable source IDs, per-revision outcomes and citations, and acceptance of
   the latest revision. MCP exercises the same workflow, typed Streamable HTTP,
   and a real STDIO subprocess.
 - `unit`: source mapping, parallel four-source retrieval and partial failure,
   structured stateless model calls, session transitions, atomic persistence,
-  concurrency conflicts, expiry, and public response projection.
+  concurrency conflicts, expiry, legacy unknown provenance, known empty evidence,
+  and public response projection without full evidence snapshots.
 - Acceptance and QA tests retain publication retry, cancellation, lost write
   acknowledgements, immutable acceptance decisions, course-scoped retrieval,
   version protection, and recovery. These protect the MVP's QA write path.
